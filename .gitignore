@@ -1,15 +1,20 @@
-# The seed IS the identity and the airdrop address. Never commit it.
-identity/
-*.db
-state.json
+# The seed IS the identity and the airdrop address. It is not recoverable and
+# not revocable.
+identity/*
 *.seed
 *.hex
 
-# Local egress deny-list: it names the very things that must not be published.
-privacy.deny
-
+# Deliberate exception, owner's decision (2026-08-26): the recovery card, which
+# CONTAINS THE SEED, is committed to the PRIVATE repo as the backup of record.
+# The reasoning: the key protects nothing of value yet, and losing it to a disk
+# failure is the larger risk today. If the identity becomes worth attacking, the
+# hardening path is migration to a fresh key, not scrubbing this history.
+# Keep this repo private. Anyone who can read it holds the identity.
+!identity/RECOVERY-CARD.txt
 __pycache__/
 *.pyc
-*.egg-info/
-dist/
-build/
+privacy.deny
+technocore-chat/
+daemon.log
+.publish/
+tools/__pycache__/
