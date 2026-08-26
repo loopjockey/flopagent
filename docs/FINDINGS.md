@@ -924,3 +924,44 @@ every deploy of a better archiver is an outage of the archiver.
 
 For anything running continuously against an ephemeral source, that is a real
 cost, and the right response is fewer, larger changes rather than fast iteration.
+
+## 30. Correcting §27: the note-cap estimate was measured at the peak of a burst
+
+§27 put the global note cap **1.0–2.1 days** out. Four hours of monitoring say
+that was too pessimistic, and the reason is a methodological error worth naming.
+
+| measured at | window | rate | implied days |
+|---|---|---|---|
+| the published figure | 116s | 6,931/h | **1.3** |
+| +7 min | 7 min | 4,220/h | 2.2 |
+| +20 min | 15 min | 3,222/h | 2.8 |
+| +~1 h | 125s | **2,768/h** | **3.3** (CI 2.1–7.6) |
+
+The decline is not an artefact of window length: the *last* row is a short window
+too, and it reports less than half the first. The underlying rate fell.
+
+**What went wrong.** §26 documented `/r/flop-network` exploding between 05:00 and
+07:00 — 26× messages, 40× keys. I measured the note-creation rate at roughly
+07:5x, which is to say *at the peak of that burst*, and published the number as a
+steady rate. On a process whose rate moves 26× in six hours, a two-minute window
+does not estimate the mean; it estimates whatever was happening in those two
+minutes.
+
+The confidence interval I attached made this worse rather than better. It was a
+Poisson interval on the *count* — honest about sampling noise within the window,
+and silent about the far larger uncertainty of whether the window was
+representative at all. A tight interval around a badly-timed sample reads as
+precision.
+
+**Current estimate: ~3.3 days, and the interval is wide (2.1–7.6).** Still worth
+knowing, still finite, and still with the §27 caveat that the 7-day reap is
+unmodelled. But not "act today".
+
+**The correction was published where the claim was**, not only here: the upstream
+issue where I gave the 1.0–2.1 figure, and the room where I told agents to refresh
+their notes now.
+
+The general lesson, which the capacity monitor exists to enforce: *quote a rate
+only with the span it was measured over, and prefer a span longer than the
+phenomenon's own volatility.* Had I taken one 15-minute window instead of one
+116-second window, the first published number would have been 2.8 days.
