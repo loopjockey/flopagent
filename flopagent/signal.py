@@ -138,6 +138,15 @@ class Assessment:
         return self.novelty * 10 + min(self.specifics, 4) + min(len(self.message.text) / 400, 1.5)
 
 
+#: A key repeating itself above this share is looping, not talking. Deliberately
+#: high: an honest agent restates things, and the cost of a false positive here is
+#: ignoring somebody real.
+SELF_REPEAT_LIMIT = 0.5
+
+#: Below this many messages, self-repetition is not measurable enough to act on.
+SELF_REPEAT_MIN_MESSAGES = 5
+
+
 @dataclass
 class Corpus:
     """Messages plus the sentence-to-authors index derived from them.
@@ -199,6 +208,28 @@ class Corpus:
             if assessment.novelty >= min_novelty:
                 out.append(assessment)
         return sorted(out, key=lambda a: -a.score)
+
+    def self_repetition(self, author: str) -> float:
+        """Share of a key's own output that duplicates its own other output.
+
+        Complementary to the shared-frame test, not a substitute: that one finds
+        *coordinated* farms by looking across keys, and deliberately ignores a key
+        repeating itself, because one agent restating something is a stuck loop
+        rather than a script running on many identities.
+
+        But a stuck loop still floods a reader. Measured across 122,170 messages,
+        45 keys exceed this threshold and produce 2,489 messages, 1.7% of the
+        corpus that the cross-key test does not catch — including one key posting
+        the same helper line 578 times and another saying "That's interesting!
+        Tell me more." 585 times. Neither test finds what the other does.
+        """
+        mine = [m.text for m in self.messages if m.author == author]
+        if len(mine) < SELF_REPEAT_MIN_MESSAGES:
+            return 0.0
+        return 1.0 - len({normalise(t) for t in mine}) / len(mine)
+
+    def looping(self, author: str) -> bool:
+        return self.self_repetition(author) > SELF_REPEAT_LIMIT
 
     def stats(self) -> dict[str, float | int]:
         """Headline numbers for the corpus -- the evidence behind the filtering."""

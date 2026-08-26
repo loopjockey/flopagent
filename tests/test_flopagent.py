@@ -1398,3 +1398,52 @@ class TestAssistTargeting(unittest.TestCase):
                 corpus.add(Message("r", 1, "did:key:zX", text))
                 found = Assistant().find(corpus, "did:key:zMe", set())
                 self.assertEqual(found[0].answer.key, want)
+
+
+class TestSelfRepetition(unittest.TestCase):
+    """Complementary to the shared-frame test: solo loops vs coordinated farms.
+
+    The cross-key test deliberately ignores a key repeating itself, because one
+    agent restating something is a stuck loop rather than a script on many
+    identities. But a stuck loop still floods a reader, and neither test finds
+    what the other does.
+    """
+
+    def _corpus(self, author, texts):
+        from flopagent.signal import Corpus, Message
+        corpus = Corpus()
+        for i, text in enumerate(texts):
+            corpus.add(Message("lobby", i, author, text))
+        return corpus
+
+    def test_a_key_saying_one_thing_forever_is_looping(self):
+        corpus = self._corpus("did:key:zBot", ["Helper bot at your service!"] * 20)
+        self.assertGreater(corpus.self_repetition("did:key:zBot"), 0.9)
+        self.assertTrue(corpus.looping("did:key:zBot"))
+
+    def test_a_varied_key_is_not(self):
+        corpus = self._corpus("did:key:zReal",
+                              [f"a distinct thought number {i}" for i in range(20)])
+        self.assertEqual(corpus.self_repetition("did:key:zReal"), 0.0)
+        self.assertFalse(corpus.looping("did:key:zReal"))
+
+    def test_too_few_messages_to_judge(self):
+        # Two identical messages is not evidence of a loop.
+        corpus = self._corpus("did:key:zQuiet", ["hello there", "hello there"])
+        self.assertEqual(corpus.self_repetition("did:key:zQuiet"), 0.0)
+
+    def test_assist_ignores_a_question_from_a_looping_key(self):
+        from flopagent.assist import Assistant
+        question = ("does the server ever purge old nonces, or does that nonce "
+                    "table just grow forever?")
+        corpus = self._corpus("did:key:zBot", [question] * 8)
+        self.assertEqual(Assistant().find(corpus, "did:key:zMe", set()), [])
+
+    def test_assist_still_answers_a_varied_key(self):
+        from flopagent.assist import Assistant
+        texts = [f"some distinct remark number {i}" for i in range(6)]
+        texts.append("does the server ever purge old nonces, or does that nonce "
+                     "table just grow forever?")
+        corpus = self._corpus("did:key:zReal", texts)
+        found = Assistant().find(corpus, "did:key:zMe", set())
+        self.assertEqual([c.answer.key for c in found], ["nonce-storage"])

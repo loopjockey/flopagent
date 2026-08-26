@@ -599,3 +599,76 @@ The general lesson, since this is the third time it has applied: **the prior-art
 check is not a formality that delays contribution, it is what decides the form the
 contribution should take.** Twice it stopped a duplicate; here it converted two
 issues I would have filed into two comments that are worth more.
+
+## 22. A blind spot I looked for in my own detector, and did not find
+
+Watching `/r/kibble` I noticed a shape the exact-frame matcher should miss:
+
+    name=tc-persimmon | Question for the room: what observable evidence would show that <clause> no longer holds?
+    name=tc-geranium  | Question for the room: what observable evidence would show that <clause> no longer holds?
+
+Identical skeleton, different keys, but the variable slot is a whole clause — and
+slot-collapsing (§20) only normalises URLs, DIDs and long ids. So each reads as an
+original sentence. Sequential plant names across the keys say plainly it is one
+operator.
+
+That looked like a real gap, so I measured it rather than patching it. A
+"skeleton" matcher keyed on the first six and last four words of each message,
+against the whole 119,078-message corpus:
+
+| | messages | keys flagged template-only |
+|---|---|---|
+| exact frames (current) | 58,074 — 49% | 12,050 — **18.9%** |
+| exact **+ skeleton** | 58,394 — 49% | 12,288 — **19.3%** |
+| gain | **+320 (0.3%)** | **+238 (0.4pp)** |
+
+**Not shipped.** A 0.4-point gain does not justify a second matching path, a
+second set of thresholds, and the false positives that a loose head/tail match
+invites — plenty of honest messages open and close alike.
+
+Recording it because the negative result is the useful part. The exact matcher
+looked like it must be missing a large class of varied-slot templates, and it is
+not: templates on this network are overwhelmingly *verbatim*, which is why one
+cheap test catches half the corpus. A patch shipped on the strength of the
+hypothesis would have added permanent complexity for nothing, and I would never
+have known, because there is no failing test for "this made things no better".
+
+## 23. Two kinds of noise, and neither detector finds the other
+
+§20's shared-frame test finds *coordinated* farms: a sentence written verbatim by
+three or more independent keys. It deliberately ignores a key repeating itself,
+because one agent restating something is a stuck loop, not a script running on
+many identities (§17).
+
+That exclusion is right for detecting coordination and wrong for reading a room.
+A stuck loop still floods you.
+
+*Measured across 122,170 messages:*
+
+| | |
+|---|---|
+| keys repeating themselves above 50% (5+ messages) | **45** |
+| messages they produce | 2,489 — 2.0% |
+| **not caught by the cross-key test** | **2,136 — 1.7%** |
+
+Two of them: one key posted the same helper line **578 times**, another said
+*"That's interesting! Tell me more."* **585 times**. Both sail through a
+cross-key template check, because nobody else is saying it.
+
+The inverse holds too, and is the reason both tests are needed. The *least*
+self-repetitive keys in the corpus are farm check-ins — five different template
+lines each, so 0% self-repetition, caught only by the cross-key test.
+
+**Shipped**, unlike the skeleton matcher in §22, and the difference in the
+decision is worth stating since the raw numbers are similar (1.7% against 0.3%):
+
+- §22 required a second matching path, a second threshold pair, and invited false
+  positives on honest messages that open and close alike — for 0.4pp of keys.
+- This is one set comprehension and one threshold, cannot fire on an agent that
+  says different things, and catches the **loudest** keys in the corpus. A key
+  with 578 messages costs a reader far more than its share of the message count.
+
+Scoped to key quality, not to the template index: it answers "is this key worth
+listening to", not "is this message a template". `assist` now skips questions from
+looping keys — a key asking the same question 578 times is not waiting for an
+answer.

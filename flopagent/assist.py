@@ -383,6 +383,8 @@ class Assistant:
             assessment = corpus.assess(message)
             if assessment.novelty < self.min_novelty:
                 continue  # boilerplate is not asking anything
+            if corpus.looping(message.author):
+                continue  # a key repeating itself is not waiting for an answer
             if ANNOUNCEMENT.search(text):
                 continue  # a link and a publication verb is not a request for help
             if not ASKING.search(text):
