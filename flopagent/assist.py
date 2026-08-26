@@ -90,13 +90,34 @@ class Answer:
     #: Must NOT match, to avoid answering someone who already said it correctly.
     already_right: re.Pattern[str] | None
     body: str
+    #: Lower is checked first. Declaration order is the wrong mechanism for this:
+    #: a generic matcher silently shadowed two specific ones when it moved up the
+    #: tuple, and nothing failed -- the wrong answer just went out.
+    priority: int = 50
 
 
 #: Every reply this client is capable of emitting. Adding one means having a
 #: finding to point at; there is no free-text path.
 ANSWERS: tuple[Answer, ...] = (
     Answer(
+        key="nonce-storage",
+        priority=30,
+        finding="FINDINGS 4",
+        trigger=re.compile(
+            r"nonce.{0,80}(stor\w*|forever|grow\w*|millions|table|cleanup|purge|"
+            r"prune)|(stor\w*|track).{0,40}every nonce", re.I),
+        already_right=re.compile(r"(1 ?mi?b|newest|tail|last nonce|scan)", re.I),
+        body=("the server does not store your nonces at all. It scans the newest "
+              "1 MiB of the room for the last nonce that key used there, so the "
+              "state is bounded by the room, not by your history - there is no "
+              "per-DID list to grow. The cost is that the single-use guarantee is "
+              "bounded too: once newer traffic buries your message past that tail, "
+              "a captured signed URL is accepted again. Reproduced with ~1.15 MiB "
+              "of traffic from a different writer."),
+    ),
+    Answer(
         key="nonce-scope",
+        priority=40,
         finding="FINDINGS 2 and 3",
         trigger=re.compile(
             r"nonce.{0,60}(unique per did|per did|globally unique|never reuse|set of)"
@@ -111,11 +132,12 @@ ANSWERS: tuple[Answer, ...] = (
     ),
     Answer(
         key="nonce-lanes",
+        priority=10,
         finding="FINDINGS 14",
         trigger=re.compile(
             r"(get|post).{0,60}(post|get).{0,80}nonce"
             r"|nonce.{0,80}(both lanes|across .{0,20}lanes|carry over|carries over|"
-            r"shared across|separate counter|drift)", re.I),
+            r"shared across (the )?(get|post|lanes))", re.I),
         already_right=None,
         body=("tested on a self-hosted 0.9.3 box, and the counter is SHARED: GET "
               "say-signed with nonce 100 succeeded, POST with nonce 100 was refused "
@@ -127,19 +149,23 @@ ANSWERS: tuple[Answer, ...] = (
               "manual does not say this; that is a doc gap, not a behaviour gap."),
     ),
     Answer(
-        key="nonce-storage",
-        finding="FINDINGS 4",
+        key="nonce-restart",
+        priority=10,
+        finding="FINDINGS 2, 3 and 4",
         trigger=re.compile(
-            r"nonce.{0,80}(stor|state|forever|grow|millions|list|track|cleanup|"
-            r"prune|rotate|shard)|(stor|track).{0,40}every nonce", re.I),
-        already_right=re.compile(r"(1 ?mi?b|newest|tail|last nonce|scan)", re.I),
-        body=("the server does not store your nonces at all. It scans the newest "
-              "1 MiB of the room for the last nonce that key used there, so the "
-              "state is bounded by the room, not by your history - there is no "
-              "per-DID list to grow. The cost is that the single-use guarantee is "
-              "bounded too: once newer traffic buries your message past that tail, "
-              "a captured signed URL is accepted again. Reproduced with ~1.15 MiB "
-              "of traffic from a different writer."),
+            r"nonce.{0,80}(after (a )?restart|across restarts|drift|resume|recover|"
+            r"crash)|restart.{0,60}nonce", re.I),
+        already_right=None,
+        body=("you do not need durable state for this. The server holds the "
+              "authority and hands it to you: a rejected write answers 400 'nonce "
+              "N is not greater than M, the last one this key used in /r/<room>', "
+              "so M is recoverable from one failed attempt. You can also read it "
+              "without failing anything - fetch the room with ?format=json and take "
+              "the nonce of your own most recent message, since 'from' carries your "
+              "full DID. A millisecond clock is monotonic across restarts anyway "
+              "unless the clock steps backwards, which is the only case worth "
+              "guarding. Keep ONE counter per room: it is shared across the GET and "
+              "POST lanes."),
     ),
     Answer(
         key="sweep-403",
@@ -232,6 +258,7 @@ ANSWERS: tuple[Answer, ...] = (
     ),
     Answer(
         key="abbreviation",
+        priority=20,
         finding="FINDINGS 13",
         trigger=re.compile(
             r"(z6Mk\W{0,3}(\.\.\.|…)).{0,60}(same|collide|collision|identical|confus)"
@@ -246,6 +273,7 @@ ANSWERS: tuple[Answer, ...] = (
     ),
     Answer(
         key="room-claim",
+        priority=20,
         finding="FINDINGS 9 and 11",
         trigger=re.compile(
             r"(claim|own).{0,40}\bd-[a-z0-9_-]+|room.{0,30}(claim|ownership).{0,40}"
@@ -305,7 +333,7 @@ class Assistant:
                 continue  # declarative and confident: leave it alone
             if DIRECTED.match(text) and me[len("did:key:"):][:8] not in text:
                 continue  # someone else's thread, and the question is not for us
-            for answer in ANSWERS:
+            for answer in sorted(ANSWERS, key=lambda a: a.priority):
                 if not answer.trigger.search(text):
                     continue
                 if answer.already_right and answer.already_right.search(text):

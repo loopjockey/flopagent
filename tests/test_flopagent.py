@@ -1073,3 +1073,63 @@ class TestJournal(unittest.TestCase):
 
     def test_empty_journal_says_so_rather_than_inventing(self):
         self.assertIn("nothing recorded", self.Journal(self.path).report(hours=1))
+
+
+class TestAnswerRouting(unittest.TestCase):
+    """Four nonce questions that share vocabulary must reach four answers.
+
+    These shadowed each other in production: a generic matcher moved up the tuple
+    and silently captured two specific ones, and the wrong answer went out to a
+    real agent. Declaration order is not a specificity mechanism; `priority` is.
+    """
+
+    def _route(self, text):
+        from flopagent.assist import Assistant
+        from flopagent.signal import Corpus, Message
+        corpus = Corpus()
+        corpus.add(Message("r", 1, "did:key:zSomeone", text))
+        found = Assistant().find(corpus, "did:key:zMe", set())
+        return found[0].answer.key if found else None
+
+    def test_storage_question(self):
+        self.assertEqual(self._route(
+            "So the server stores every nonce forever - that is a lot of state to "
+            "track per DID. What happens when the nonce table grows into the "
+            "millions?"), "nonce-storage")
+
+    def test_restart_recovery_question(self):
+        # Mis-answered live with the GET/POST lane answer, because "drift" was in
+        # the lane trigger. The question is about restarts, not lanes.
+        self.assertEqual(self._route(
+            "How do you recommend agents detect and recover from per-room nonce "
+            "drift after restarts without keeping durable state?"), "nonce-restart")
+
+    def test_lane_question(self):
+        self.assertEqual(self._route(
+            "manual never says if nonce state is shared across both lanes for one "
+            "did+room - alternate GET then POST, does the counter carry over?"),
+            "nonce-lanes")
+
+    def test_scope_misconception(self):
+        self.assertEqual(self._route(
+            "I keep reading that the nonce must be unique per DID globally - is "
+            "that right?"), "nonce-scope")
+
+    def test_every_answer_has_a_finding_to_point_at(self):
+        from flopagent.assist import ANSWERS
+        for answer in ANSWERS:
+            with self.subTest(answer=answer.key):
+                self.assertTrue(answer.finding.strip())
+                self.assertTrue(answer.body.strip())
+
+    def test_priorities_are_explicit_where_triggers_overlap(self):
+        from flopagent.assist import ANSWERS
+        nonce = [a for a in ANSWERS if a.key.startswith("nonce-")]
+        self.assertGreater(len(nonce), 1)
+        # The generic one must never be checked before the specific ones.
+        storage = next(a for a in nonce if a.key == "nonce-storage")
+        for specific in ("nonce-lanes", "nonce-restart"):
+            with self.subTest(specific=specific):
+                self.assertLess(
+                    next(a for a in nonce if a.key == specific).priority,
+                    storage.priority)
