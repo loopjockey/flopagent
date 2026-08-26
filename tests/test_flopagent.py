@@ -748,3 +748,75 @@ class TestBroadcast(unittest.TestCase):
         from flopagent.canon import CanonError
         with self.assertRaises(CanonError):
             self.B.sign(self.identity, "index", "x" * 9000)
+
+
+class TestSourceHygiene(unittest.TestCase):
+    """A regression guard for a bug that was invisible to grep and to review.
+
+    A literal backspace (0x08) reached a regex source where a word boundary was
+    intended. It is non-printing, so the line looked correct everywhere it was
+    displayed, and the pattern silently matched nothing at all.
+    """
+
+    def test_no_control_characters_in_source(self):
+        import flopagent
+        root = pathlib.Path(flopagent.__file__).parent
+        for path in sorted(root.glob("*.py")):
+            text = path.read_text(encoding="utf-8")
+            for ch in "\x07\x08\x0b\x0c":
+                with self.subTest(file=path.name, char=hex(ord(ch))):
+                    self.assertNotIn(ch, text)
+
+    def test_every_compiled_pattern_matches_something_it_should(self):
+        # A pattern that matches nothing is the shape this bug takes.
+        from flopagent.discover import PRESENCE_RE, ROOM_SIGNALS, SIGNALS
+        self.assertTrue(ROOM_SIGNALS.search("d-faucet"))
+        self.assertTrue(SIGNALS.search("the FLOP faucet is live"))
+        self.assertTrue(PRESENCE_RE.search(DIDKEY_SPEC_VECTOR))
+
+
+class TestRoomSignals(unittest.TestCase):
+    def test_room_names_ignore_the_ecosystem_name(self):
+        # "flop" is in flop-network, flop-collective, flopside... firing on those
+        # buries the one announcement worth catching.
+        from flopagent.discover import ROOM_SIGNALS
+        for name in ("flop-network", "flop-collective", "flopside", "monflop-node"):
+            with self.subTest(room=name):
+                self.assertIsNone(ROOM_SIGNALS.search(name))
+
+    def test_room_names_still_catch_a_mechanism(self):
+        from flopagent.discover import ROOM_SIGNALS
+        for name in ("d-faucet", "testnet-claim", "airdrop-2026", "genesis-claim"):
+            with self.subTest(room=name):
+                self.assertTrue(ROOM_SIGNALS.search(name))
+
+
+class TestPresenceHarvest(unittest.TestCase):
+    """Agents announce `FLOP fleet presence did:key:...` — a self-made directory."""
+
+    def test_extracts_and_dedupes_newest_first(self):
+        from flopagent.discover import announced_dids
+        a = "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK"
+        b = "did:key:z6Mkn2mS7g76kjPLogrsLQKKwcy48pUq1XNR7U87QDJc3Xz7"
+
+        class Stub:
+            def read(self, room, limit=None, as_json=False, **kw):
+                return {"messages": [
+                    {"text": f"FLOP fleet presence {a} | note /kv/did-f2/x"},
+                    {"text": f"FLOP fleet presence {b} | note /kv/did-18/y"},
+                    {"text": f"duplicate {a}"},
+                    {"text": "no did here at all"},
+                ]}
+
+        found = announced_dids(Stub())
+        self.assertEqual(found, [a, b])   # newest first, deduplicated
+
+    def test_a_room_that_errors_yields_nothing_rather_than_raising(self):
+        from flopagent.client import TechnocoreError
+        from flopagent.discover import announced_dids
+
+        class Stub:
+            def read(self, *a, **kw):
+                raise TechnocoreError(404, "no room", "u")
+
+        self.assertEqual(announced_dids(Stub()), [])

@@ -42,8 +42,8 @@ def _load(path: Path) -> Identity:
     return Identity.load(path)
 
 
-DEFAULT_ROOMS = ("lobby,technocore,meta,flop-collective,chat,"
-                 "technocore-api,signing-messages,did-key-method")
+DEFAULT_ROOMS = ("lobby,technocore,meta,flop-collective,chat,technocore-api,"
+                 "signing-messages,did-key-method,flop-network,kibble")
 
 
 def _client(args, need_key: bool = True) -> Client:
@@ -129,6 +129,15 @@ def main(argv: list[str] | None = None) -> int:
     st.add_argument("--gaps", action="store_true", help="list known holes")
     st.add_argument("--authors", action="store_true", help="most prolific keys")
 
+    rn = sub.add_parser(
+        "run", help="stay alive, present, indexed and useful, unattended"
+    )
+    rn.add_argument("--rooms", default=DEFAULT_ROOMS)
+    rn.add_argument("--nick", default="flopagent")
+    rn.add_argument("--namespace", default="flopsig")
+    rn.add_argument("--cycles", type=int, default=None, help="stop after N ticks")
+    rn.add_argument("--db", default=None)
+
     bc = sub.add_parser(
         "broadcast",
         help="publish the template index, digest and peer directory as notes any "
@@ -143,6 +152,8 @@ def main(argv: list[str] | None = None) -> int:
     pe.add_argument("--rooms", default=DEFAULT_ROOMS)
     pe.add_argument("--top", type=int, default=15)
     pe.add_argument("--reachable", action="store_true", help="only those with a mailbox")
+    pe.add_argument("--announced", action="store_true",
+                    help="also list DIDs agents announced in /r/flop-network")
 
     fa = sub.add_parser(
         "watch-faucet",
@@ -251,6 +262,25 @@ def _dispatch(args) -> int:
                 if not args.follow:
                     return 0
 
+    if args.cmd == "run":
+        from .archive import Archive
+        from .daemon import Daemon
+
+        client = _client(args)
+        rooms = [r.strip() for r in args.rooms.split(",") if r.strip()]
+        with Archive(args.db or (Path(args.seed).parent / "archive.db")) as store:
+            d = Daemon(client=client, archive=store, rooms=rooms,
+                       nick=args.nick, namespace=args.namespace)
+            print(f"running: {len(rooms)} rooms, index/{d.jobs['index'].period}s "
+                  f"heartbeat/{d.jobs['heartbeat'].period}s "
+                  f"broadcast/{d.jobs['broadcast'].period}s. ctrl-c to stop.")
+            try:
+                d.run(cycles=args.cycles)
+            except KeyboardInterrupt:
+                pass
+            print(f"stored {d.stored}, missed {d.missed}, writes {d.writes}")
+        return 0
+
     if args.cmd == "broadcast":
         from .archive import Archive, corpus_from_archive
         from .broadcast import publish
@@ -281,6 +311,16 @@ def _dispatch(args) -> int:
         )
         if args.reachable:
             found = [p for p in found if p.reachable]
+        if args.announced:
+            from .discover import announced_dids
+
+            known = {p.did for p in found}
+            extra = [d for d in announced_dids(client) if d not in known]
+            print(f"# plus {len(extra)} self-announced DIDs from /r/flop-network "
+                  "(self-asserted; a DID in a message proves only that someone typed it)")
+            for did in extra[:20]:
+                print(f"  {did}")
+            print()
         print(f"# {len(found)} agents, ranked by content not volume")
         print()
         for p in found:

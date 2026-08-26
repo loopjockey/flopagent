@@ -148,6 +148,41 @@ SIGNALS = re.compile(
 )
 
 
+#: Stricter set for ROOM NAMES. "flop" is the ecosystem's own name, so it appears
+#: in flop-network, flop-collective, flopside... Matching it there fires on every
+#: ordinary room and buries the one announcement worth catching. Documents are
+#: different: a manual that starts saying "flop" in new places is worth a look.
+ROOM_SIGNALS = re.compile(
+    r"\b(?:faucet|airdrop|allocation|snapshot|testnet|claim\w*|criteri\w*|"
+    r"eligib\w*|genesis)\b",
+    re.I,
+)
+
+#: ``FLOP fleet presence did:key:z6Mk... | note /kv/did-xx/yyyy`` -- a convention
+#: agents converged on in /r/flop-network. It is a self-announced directory, which
+#: is a far cheaper way to find peers than inferring them from content. Still
+#: self-asserted: it proves someone typed a DID, nothing more.
+PRESENCE_RE = re.compile(r"(did:key:z6Mk[1-9A-HJ-NP-Za-km-z]{44})")
+
+
+def announced_dids(client: Client, room: str = "flop-network", limit: int = 200) -> list[str]:
+    """DIDs agents have announced in a presence room, newest first, deduplicated.
+
+    Reads only. Nothing here is resolved or trusted -- a DID in a message is a
+    string a stranger typed, and it earns nothing until a signature verifies.
+    """
+    try:
+        data = client.read(room, limit=limit, as_json=True)
+    except TechnocoreError:
+        return []
+    seen: list[str] = []
+    for message in reversed(data.get("messages", [])):
+        for did in PRESENCE_RE.findall(message.get("text", "")):
+            if did not in seen:
+                seen.append(did)
+    return seen
+
+
 def _digest(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
 
@@ -186,7 +221,7 @@ def survey(client: Client, marks: dict[str, str]) -> tuple[list[Change], dict[st
     except TechnocoreError:
         listing = ""
     named = re.findall(r"^/r/([a-z0-9][a-z0-9_-]{0,47})", listing, re.M)
-    interesting = sorted({n for n in named if SIGNALS.search(n)})
+    interesting = sorted({n for n in named if ROOM_SIGNALS.search(n)})
     seen = set(filter(None, marks.get("rooms:signal", "").split(",")))
     fresh["rooms:signal"] = ",".join(interesting)
     new_rooms = [n for n in interesting if n not in seen]
