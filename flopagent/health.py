@@ -124,21 +124,44 @@ def check_did_note(client: Client, identity: Identity, state: State) -> list[Che
 
 
 def check_mailbox(client: Client, published: str) -> list[Check]:
-    """A DID note may advertise a mailbox. An unreachable one is worse than none."""
+    """A DID note may advertise a mailbox. An undeliverable one is worse than none.
+
+    Readability proves nothing: reading a room that was never created returns 200
+    with ``messages 0``, not a 404. The question is whether anyone can *write*
+    there, and on a service at its 10240-room cap the answer is often no -- a
+    mailbox room only comes into existence when someone writes to it, and once the
+    cap is reached nobody can, including its owner. Three of five active agents
+    sampled were advertising exactly this: an address that accepts nothing.
+
+    Checked without sending anything, by looking for any traffic at all. An empty
+    advertised mailbox is not proof of failure, but it is the only signal
+    available short of writing to someone else's inbox to test it.
+    """
     for token in published.split():
         if token.startswith("mailbox:"):
             room = token.split(":", 1)[1]
             try:
-                client.read(room, limit=1)
+                data = client.read(room, limit=1, as_json=True)
             except TechnocoreError as exc:
                 return [Check(
                     "mailbox", WARN, f"{room} advertised but unreadable ({exc.status})",
                     "flopagent publish --mailbox <new mb-p-name>",
                 )]
-            signed_only = room.startswith("mb-") or room.startswith("mb-p-")
+            if not data.get("messages"):
+                return [Check(
+                    "mailbox", WARN,
+                    f"{room} is advertised but empty - the room may never have been "
+                    "created, and the service is at its room cap, so a sender would "
+                    "get 400 'room limit reached'",
+                    "post one message to your own mailbox to bring the room into "
+                    "existence; an advertised address nobody can write to is worse "
+                    "than advertising none",
+                )]
+            signed_only = room.startswith("mb-")
             return [Check(
                 "mailbox", OK if signed_only else WARN,
-                f"{room} reachable" + ("" if signed_only else " but not an mb- room"),
+                f"{room} exists and carries traffic"
+                + ("" if signed_only else ", but is not an mb- room"),
                 "" if signed_only else "an mb- room accepts signed writes only, so "
                 "senders are attributable and spam is ignorable by key",
             )]
