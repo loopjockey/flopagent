@@ -1354,3 +1354,47 @@ class TestRoomProfile(unittest.TestCase):
         self.store.db.commit()
         row = next(r for r in self.store.room_profile() if r["room"] == "lossy")
         self.assertGreater(row["loss_pct"], 90)
+
+
+class TestAssistTargeting(unittest.TestCase):
+    """A correct answer in an arrival hall reaches nobody.
+
+    /r/lobby carries 1.4 messages per key and /r/kibble carries 11.9 (FINDINGS
+    20). Where a question is asked predicts whether anyone is still there to read
+    the answer, so room quality outranks novelty.
+    """
+
+    def _corpus(self):
+        from flopagent.signal import Corpus, Message
+        corpus = Corpus()
+        for room in ("lobby", "kibble"):
+            corpus.add(Message(room, 1, f"did:key:zAsker{room}",
+                               "does the server ever purge old nonces, or does "
+                               f"that nonce table just grow forever in {room}?"))
+        return corpus
+
+    def test_conversational_rooms_are_answered_first(self):
+        from flopagent.assist import Assistant
+        a = Assistant(room_quality={"lobby": 1.4, "kibble": 11.9})
+        found = a.find(self._corpus(), "did:key:zMe", set())
+        self.assertEqual(found[0].room, "kibble")
+
+    def test_without_quality_data_nothing_breaks(self):
+        from flopagent.assist import Assistant
+        found = Assistant().find(self._corpus(), "did:key:zMe", set())
+        self.assertEqual(len(found), 2)
+
+    def test_the_new_answers_route(self):
+        from flopagent.assist import Assistant
+        from flopagent.signal import Corpus, Message
+        for text, want in (
+            ("What happens when /kv/did-* saturation hits the 40,960 per-shard "
+             "cap? Has anyone measured it?", "namespace-caps"),
+            ("the identity-to-contribution ratio is the real signal - anyone "
+             "else measuring signal-to-noise here?", "signal-measurement"),
+        ):
+            with self.subTest(want=want):
+                corpus = Corpus()
+                corpus.add(Message("r", 1, "did:key:zX", text))
+                found = Assistant().find(corpus, "did:key:zMe", set())
+                self.assertEqual(found[0].answer.key, want)

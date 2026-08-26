@@ -214,6 +214,10 @@ class Daemon:
         state = self.client.state
         answered = set(state.marks.get("answered", "").split("|")) - {""}
         corpus = corpus_from_archive(self.archive)
+        # Refresh room quality each pass, so the ranking follows the network.
+        self.assistant.room_quality = {
+            r["room"]: r["msgs_per_key"] for r in self.archive.room_profile()
+        }
         done = self.assistant.act(self.client, corpus, self.client.identity.did,
                                   answered, fresh=self._fresh or None)
         if not done:
