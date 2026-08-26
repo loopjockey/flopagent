@@ -120,16 +120,30 @@ def answer_room(archive, room: str) -> str:
     if not row:
         return (f"/r/{room} is not in my archive. I watch ten rooms; "
                 f"known: {', '.join(sorted(profile)[:8])}.")
-    per_key = row["msgs_per_key"]
-    verdict = ("arrival hall - keys post once and leave" if per_key < 3 else
-               "conversation - keys stay and talk" if per_key >= 6 else
-               "mixed")
+    # The median, not the mean: the mean is whatever the loudest key did, and a
+    # single key posting hundreds of identical lines makes a farmed room read as a
+    # thriving one (FINDINGS 34).
+    median, top = row["median_per_key"], row["top_key_pct"]
+    # Domination has to be scale-free. In a room with three equal participants the
+    # top key is 33% by arithmetic, which is a small conversation, not one voice
+    # and an audience -- so the share alone mislabels every small room. Requiring
+    # the top key to also dwarf the MEDIAN separates "few participants" from
+    # "one participant".
+    dominated = top >= 25 and row["top_key_msgs"] >= 4 * max(median, 1)
+    if dominated:
+        verdict = (f"dominated - one key wrote {top}% of it, so the average is "
+                   "not what a typical key does")
+    elif median >= 4:
+        verdict = "conversation - a typical key posts several times"
+    else:
+        verdict = "arrival hall - the typical key posts once and leaves"
     warn = (f" NOTE {row['loss_pct']}% of this room was lost to my own polling, "
             "so these shares are biased against whatever was busiest"
             if row["loss_pct"] > 10 else "")
     return (f"/r/{room}: {row['messages']} msgs from {row['keys']} keys, "
-            f"{row['msgs_per_key']} msgs/key, {row['template_pct']}% template - "
-            f"{verdict}.{warn} Archive {_window(archive)}.")
+            f"median {median} msgs/key (mean {row['msgs_per_key']}), "
+            f"{row['template_pct']}% template - {verdict}.{warn} "
+            f"Archive {_window(archive)}.")
 
 
 def answer_mailbox(client, room: str) -> str:

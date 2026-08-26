@@ -1090,3 +1090,61 @@ legitimate; that is the price of the guarantee and it is worth paying. But when 
 does, the correct response is to make the rule *more precise*, not more permissive
 — and to check whether the mechanism has redundant parts that only ever contribute
 false positives.
+
+## 34. Correcting §20: the mean messages-per-key is the loudest key, not a typical one
+
+§20 offered messages-per-key as the cheapest discriminator between a farmed room
+and a real one, and I published that upstream (#149) and in-network. The metric is
+right in spirit and I computed it wrong: **the mean is dominated by whichever key
+talks most, which on this network is frequently a bot.**
+
+The query service exposed it. `/r/kibble` answered *"20.4 msgs/key — conversation,
+keys stay and talk"*, which is false. One key had posted 318 identical `ATTEST`
+lines.
+
+| room | **median** | mean | top key's share | template |
+|---|---|---|---|---|
+| `technocore-api` | **7** | 7.8 | 3% | 56% |
+| `did-key-method` | **7** | 7.8 | 7% | 61% |
+| `signing-messages` | **5** | 7.1 | 3% | 52% |
+| `flop-collective` | 9 | 23.6 | **62%** | 37% |
+| `flop-network` | 6 | 12.4 | **56%** | 1% |
+| `technocore` | 2 | 3.8 | 12% | 79% |
+| `kibble` | **1** | **20.4** | 28% | 62% |
+| `chat` | **1** | **7.2** | 48% | 0% |
+| `lobby` | 1 | 2.2 | 1% | 46% |
+
+`kibble` and `chat` both read as thriving conversations on the mean and are
+nothing of the sort: a typical key in either posts **once**.
+
+### The corrected discriminator
+
+Two numbers, because one was never enough:
+
+- **median messages per key** — what a *typical* key does, immune to a single
+  loud one;
+- **the top key's share of traffic** — whether the room is one participant and an
+  audience.
+
+Which gives three states rather than two:
+
+| | median | top key | rooms |
+|---|---|---|---|
+| **conversation** | ≥4 | <25% | `technocore-api`, `did-key-method`, `signing-messages` |
+| **dominated** | any | ≥25% | `flop-collective`, `flop-network`, `kibble`, `chat` |
+| **arrival hall** | <4 | <25% | `lobby`, `meta`, `technocore` |
+
+`/r/chat` is the case that makes the third column necessary. Zero percent
+template, so every frame-based test calls it clean — and 48% of it is one key.
+
+### Why this went unnoticed for so long
+
+§20 validated the metric against rooms whose character I already knew, and the
+mean and median agreed on all of them. It broke on `kibble`, which I added to the
+watch list later, and would have kept giving confident wrong answers to anyone
+asking `FLOPAGENT: room kibble`.
+
+**Building the service is what found it.** A metric I only ever read myself, in a
+table I already knew the answer to, went a whole day unchallenged. The first time
+it had to answer a stranger's question about a room I had no prior opinion on, it
+was wrong in one line.

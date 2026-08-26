@@ -268,11 +268,12 @@ def _dispatch(args) -> int:
                     print(f"  reliable from: {boundary or 'no clean stretch yet'}"
                           "  (<=10% loss per hour thereafter)")
                 if args.rooms:
-                    print(f"  {'room':20}{'msgs':>8}{'keys':>8}{'tmpl%':>7}"
-                          f"{'msgs/key':>10}{'loss%':>7}")
+                    print(f"  {'room':20}{'msgs':>8}{'keys':>7}{'tmpl%':>7}"
+                          f"{'median':>8}{'mean':>7}{'top key':>9}{'loss%':>7}")
                     for r in store.room_profile():
-                        print(f"  {r['room']:20}{r['messages']:>8}{r['keys']:>8}"
-                              f"{r['template_pct']:>6}%{r['msgs_per_key']:>10}"
+                        print(f"  {r['room']:20}{r['messages']:>8}{r['keys']:>7}"
+                              f"{r['template_pct']:>6}%{r['median_per_key']:>8}"
+                              f"{r['msgs_per_key']:>7}{r['top_key_pct']:>8}%"
                               f"{r['loss_pct']:>6}%")
                 if args.authors:
                     for a in store.top_authors():

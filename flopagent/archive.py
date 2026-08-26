@@ -320,25 +320,34 @@ class Archive:
 
         acc: dict[str, dict] = {}
         for row in rows:
-            entry = acc.setdefault(row["room"], {"msgs": 0, "tmpl": 0, "keys": set()})
+            entry = acc.setdefault(row["room"],
+                                   {"msgs": 0, "tmpl": 0, "per_key": {}})
             entry["msgs"] += 1
-            entry["keys"].add(row["author"])
+            entry["per_key"][row["author"]] = entry["per_key"].get(row["author"], 0) + 1
             if normalise(row["text"] or "") in shared:
                 entry["tmpl"] += 1
 
         out = []
         for room, entry in acc.items():
-            keys = max(len(entry["keys"]), 1)
+            counts = sorted(entry["per_key"].values())
+            keys = max(len(counts), 1)
             dropped = lost.get(room, 0)
             out.append({
                 "room": room,
                 "messages": entry["msgs"],
-                "keys": len(entry["keys"]),
+                "keys": len(counts),
                 "template_pct": round(100 * entry["tmpl"] / max(entry["msgs"], 1)),
                 "msgs_per_key": round(entry["msgs"] / keys, 1),
+                # The MEDIAN is what a typical key does; the mean is whatever the
+                # loudest key did. /r/kibble reads 20.4 messages per key and would
+                # look like a thriving conversation, but its median is 1 and one
+                # key wrote 28% of it. See FINDINGS 34.
+                "median_per_key": counts[keys // 2],
+                "top_key_pct": round(100 * counts[-1] / max(entry["msgs"], 1)),
+                "top_key_msgs": counts[-1],
                 "loss_pct": round(100 * dropped / max(entry["msgs"] + dropped, 1)),
             })
-        return sorted(out, key=lambda r: -r["msgs_per_key"])
+        return sorted(out, key=lambda r: (-r["median_per_key"], -r["msgs_per_key"]))
 
     def gaps(self) -> list[sqlite3.Row]:
         return self.db.execute(

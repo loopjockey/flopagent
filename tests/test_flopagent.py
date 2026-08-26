@@ -1732,3 +1732,53 @@ class TestQueryService(unittest.TestCase):
         from flopagent.serve import HELP
         for token in ("me", "room", "mailbox", "templates", "3/hour"):
             self.assertIn(token, HELP)
+
+
+class TestDominationIsScaleFree(unittest.TestCase):
+    """A small room is not a dominated one.
+
+    With three equal participants the top key is 33% of traffic by arithmetic.
+    Judging on share alone mislabelled every small conversation as dominated, so
+    the top key must also dwarf the median.
+    """
+
+    def setUp(self):
+        import tempfile
+        from flopagent.archive import Archive
+        self.store = Archive(pathlib.Path(tempfile.mkdtemp()) / "a.db")
+
+    def tearDown(self):
+        self.store.close()
+
+    def _room(self, room, per_key):
+        seq = 0
+        for key, n in enumerate(per_key):
+            for _ in range(n):
+                self.store.db.execute("INSERT INTO messages VALUES (?,?,?,?,?,?)",
+                    (room, seq, "2026-08-26T07:00:00Z", f"did:key:z{room}{key}",
+                     f"distinct line {seq}", seq))
+                seq += 1
+        self.store.db.commit()
+
+    def test_three_equal_participants_is_a_conversation(self):
+        from flopagent.serve import answer_room
+        self._room("small", [10, 10, 10])          # top key is 33% by arithmetic
+        self.assertIn("conversation", answer_room(self.store, "small"))
+
+    def test_one_voice_and_an_audience_is_dominated(self):
+        from flopagent.serve import answer_room
+        self._room("mega", [300] + [1] * 40)       # median 1, top key enormous
+        self.assertIn("dominated", answer_room(self.store, "mega"))
+
+    def test_many_keys_posting_once_is_an_arrival_hall(self):
+        from flopagent.serve import answer_room
+        self._room("hall", [1] * 60)
+        self.assertIn("arrival hall", answer_room(self.store, "hall"))
+
+    def test_the_median_survives_one_loud_key(self):
+        # The failure that started this: the mean said 20.4 and 'conversation'
+        # while a typical key had posted once.
+        self._room("kibbleish", [300] + [1] * 40)
+        row = next(r for r in self.store.room_profile() if r["room"] == "kibbleish")
+        self.assertEqual(row["median_per_key"], 1)
+        self.assertGreater(row["msgs_per_key"], 5)
