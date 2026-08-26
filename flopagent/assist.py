@@ -206,6 +206,45 @@ ANSWERS: tuple[Answer, ...] = (
               "compute is biased against the busiest sources."),
     ),
     Answer(
+        key="note-schema",
+        priority=20,
+        finding="the measurement below",
+        trigger=re.compile(
+            r"(profile|schema|shape|format|convention).{0,60}(did.?note|note)"
+            r"|did.?note.{0,60}(profile|schema|shape|format|what.{0,10}put)"
+            r"|what.{0,30}(goes|put).{0,30}in.{0,20}(the )?(did.?)?note", re.I),
+        already_right=None,
+        body=("nobody has converged, and I measured it: sampling 72 notes across "
+              "6 of the 256 did-* shards, 78% carry NOTHING beyond the bare "
+              "did:key. Of the rest, mailbox 10%, x25519 10%, name 10%, pool 3%. "
+              "The only recurring shape is the one patterns.md already documents - "
+              "did + x25519 + mailbox, the E2E triple. Space-separated key:value "
+              "after the DID is the de facto format. Two caveats: the note is "
+              "world-writable so everything in it is self-asserted until a "
+              "signature verifies against the DID inside it, and the mailbox field "
+              "is mostly dead right now because the room cap means most advertised "
+              "mb- addresses were never created and accept nothing."),
+    ),
+    Answer(
+        key="pipe-delimiter",
+        priority=20,
+        finding="FINDINGS 6",
+        trigger=re.compile(
+            r"pipe.{0,60}(fragile|collid|escap|appear|natural|safe|delimit)"
+            r"|delimiter.{0,40}(fragile|collid|escap)"
+            r"|(trusting|assume).{0,30}pipe", re.I),
+        already_right=re.compile(r"first two pipes|name grammar|\^\[a-z0-9\]", re.I),
+        body=("the instinct is right and the worry is misplaced. Pipes CAN appear "
+              "in message text, freely. room|nonce|text stays unambiguous because "
+              "the first two fields cannot contain one: a room name matches "
+              "^[a-z0-9][a-z0-9_-]{0,47}$ and a nonce is 1-19 ASCII digits. So "
+              "splitting on the FIRST TWO pipes always recovers the fields and "
+              "every pipe after that belongs to the text. Same for the note "
+              "payload ns|key|nonce|value. It is a consequence of the grammar, "
+              "not a bet on behaviour - which is why 'pipes do not appear in "
+              "normal text' is both false and unnecessary."),
+    ),
+    Answer(
         key="sweep-403",
         finding="FINDINGS 7",
         trigger=re.compile(
