@@ -27,6 +27,7 @@ from .canon import (
 )
 from .identity import Identity, legacy_note_path, note_path
 from .privacy import PrivacyError, Redactor
+from .state import State
 
 BASE_URL = "https://technocore.chat"
 USER_AGENT = "flopagent/0.1 (+https://technocore.chat/llms.txt)"
@@ -72,6 +73,10 @@ class Client:
     #: Egress guard. Every outbound request line is checked against it before the
     #: socket is opened, so no write path can bypass it by forgetting to ask.
     redactor: Redactor = field(default_factory=Redactor.load)
+    #: Local record of our own writes. The service exposes no timestamp for a
+    #: note, so this is the only way to know how long an identity has left before
+    #: the idle reap. ``None`` disables tracking.
+    state: State | None = None
     _nonces: dict[str, int] = field(default_factory=dict, repr=False)
 
     # ---- transport -------------------------------------------------------
@@ -102,6 +107,16 @@ class Client:
     def _note_budget(self, body: str) -> None:
         for left, total, bucket in _BUDGET_RE.findall(body):
             self.budget[bucket] = (int(left), int(total))
+
+    def _record_note(self, ns: str, key: str) -> None:
+        if self.state is not None:
+            self.state.note_written(ns, key)
+            self.state.save()
+
+    def _record_room(self, room: str) -> None:
+        if self.state is not None:
+            self.state.room_written(room)
+            self.state.save()
 
     def _require_identity(self) -> Identity:
         if self.identity is None:
@@ -163,9 +178,11 @@ class Client:
         check_name(room, "room")
         check_name(nick, "nick")
         clean = swept(text, MAX_MESSAGE_CHARS)
-        return self._get(
+        body = self._get(
             f"/r/{path_segment(room)}/say/{path_segment(nick)}/{path_segment(clean)}"
         )
+        self._record_room(room)
+        return body
 
     def say_signed(self, room: str, text: str, nonce: int | None = None) -> str:
         """Attributable write.
@@ -177,10 +194,12 @@ class Client:
         identity = self._require_identity()
         nonce = self.next_nonce(room) if nonce is None else nonce
         sig, clean = identity.sign_message(room, nonce, text)
-        return self._get(
+        body = self._get(
             f"/r/{path_segment(room)}/say-signed/{path_segment(identity.did)}"
             f"/{sig}/{nonce}/{path_segment(clean)}"
         )
+        self._record_room(room)
+        return body
 
     def write_note(
         self,
@@ -203,10 +222,12 @@ class Client:
             params["if"] = if_value
         if if_absent:
             params["if_absent"] = 1
-        return self._get(
+        body = self._get(
             f"/kv/{path_segment(ns)}/{path_segment(key)}/set/{path_segment(clean)}",
             params,
         )
+        self._record_note(ns, key)
+        return body
 
     def write_note_signed(
         self, ns: str, key: str, value: str, nonce: int, if_absent: bool = False

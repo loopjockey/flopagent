@@ -147,6 +147,9 @@ def issue(client, room: str, text: str, nonce: int | None = None) -> Receipt:
     )
     ns, key = receipt.note_path
     client.write_note(ns, key, receipt.encode())
+    if getattr(client, "state", None) is not None:
+        client.state.receipt_issued(room, seq)
+        client.state.save()
     return receipt
 
 

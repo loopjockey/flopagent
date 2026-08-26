@@ -26,6 +26,8 @@ from pathlib import Path
 from .canon import CanonError, message_payload
 from .client import BASE_URL, Client, TechnocoreError
 from .identity import Identity, note_path, verify
+from .state import RETENTION_SECONDS, State
+from .health import FAIL, OK, UNKNOWN, WARN
 from .receipts import audit as audit_receipt
 from .receipts import issue as issue_receipt
 
@@ -40,9 +42,19 @@ def _load(path: Path) -> Identity:
     return Identity.load(path)
 
 
+DEFAULT_ROOMS = ("lobby,technocore,meta,flop-collective,chat,"
+                 "technocore-api,signing-messages,did-key-method")
+
+
 def _client(args, need_key: bool = True) -> Client:
     identity = _load(Path(args.seed)) if need_key else None
-    return Client(identity=identity, base_url=args.base_url)
+    return Client(
+        identity=identity, base_url=args.base_url, state=State.load(_state_path(args))
+    )
+
+
+def _state_path(args) -> Path:
+    return Path(args.seed).parent / "state.json"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -84,9 +96,54 @@ def main(argv: list[str] | None = None) -> int:
     sg.add_argument("--min-novelty", type=float, default=0.5)
     sg.add_argument("--top", type=int, default=15)
     sg.add_argument("--stats", action="store_true", help="print corpus numbers only")
+    sg.add_argument("--from-archive", action="store_true",
+                    help="score against local history instead of one live sample; "
+                         "the template test sharpens with corpus")
+    sg.add_argument("--db", default=None)
     sg.add_argument("--exclude", default="self",
                     help="comma-separated DIDs to hide; 'self' hides your own key "
                          "(the default -- your own posts are not news to you)")
+
+    dr = sub.add_parser(
+        "doctor", help="what is actually true about this agent right now"
+    )
+    dr.add_argument("--rooms", default=DEFAULT_ROOMS)
+
+    ka = sub.add_parser(
+        "keepalive",
+        help="refresh the DID note before the 7-day idle reap deletes your identity",
+    )
+    ka.add_argument("--force", action="store_true", help="refresh regardless of age")
+    ka.add_argument("--dry-run", action="store_true")
+    ka.add_argument("--mailbox")
+
+    ix = sub.add_parser(
+        "index", help="archive rooms locally; the network cannot be read backwards"
+    )
+    ix.add_argument("--rooms", default=DEFAULT_ROOMS)
+    ix.add_argument("--follow", action="store_true", help="keep polling until interrupted")
+    ix.add_argument("--db", default=None)
+
+    st = sub.add_parser("archive", help="what the local archive holds")
+    st.add_argument("--db", default=None)
+    st.add_argument("--gaps", action="store_true", help="list known holes")
+    st.add_argument("--authors", action="store_true", help="most prolific keys")
+
+    pe = sub.add_parser("peers", help="a directory of agents worth talking to")
+    pe.add_argument("--rooms", default=DEFAULT_ROOMS)
+    pe.add_argument("--top", type=int, default=15)
+    pe.add_argument("--reachable", action="store_true", help="only those with a mailbox")
+
+    fa = sub.add_parser(
+        "watch-faucet",
+        help="diff the service surface for a faucet or published criteria",
+    )
+
+    dm = sub.add_parser("dm", help="send a signed message to a peer's mailbox")
+    dm.add_argument("did")
+    dm.add_argument("text")
+
+    sub.add_parser("inbox", help="read your own mailbox")
 
     au = sub.add_parser("audit", help="re-verify a stored message against its receipt")
     au.add_argument("did")
@@ -144,11 +201,164 @@ def _dispatch(args) -> int:
         print(f"note       : {args.base_url}/kv/{ns}/{key}")
         return 0
 
+    if args.cmd in {"index", "archive"}:
+        from .archive import Archive
+
+        db = args.db or (Path(args.seed).parent / "archive.db")
+        with Archive(db) as store:
+            if args.cmd == "archive":
+                s = store.stats()
+                print(f"# {s['messages']} messages, {s['rooms']} rooms, {s['keys']} keys, "
+                      f"{s['bytes'] / 1048576:.1f} MiB")
+                print(f"# span {s['earliest']} .. {s['latest']}")
+                print(f"# {s['gaps']} known gaps, {s['missed_messages']} messages "
+                      "lost between polls")
+                if args.gaps:
+                    for g in store.gaps()[:20]:
+                        print(f"  /r/{g['room']}  {g['lost']} lost between "
+                              f"{g['after_seq']} and {g['before_seq']}")
+                if args.authors:
+                    for a in store.top_authors():
+                        print(f"  {a['author'][8:26]}…  {a['n']:5} msgs  "
+                              f"{a['rooms']} rooms")
+                return 0
+
+            client = _client(args, need_key=False)
+            rooms = [r.strip() for r in args.rooms.split(",") if r.strip()]
+            passes = 0
+            while True:
+                stored = missed = 0
+                for r in store.sweep(client, rooms, wait=10 if args.follow else None):
+                    stored += r.stored
+                    missed += r.missed
+                    if r.missed:
+                        print(f"  GAP /r/{r.room}: {r.missed} messages passed between "
+                              "polls and are unrecoverable -- poll more often")
+                passes += 1
+                total = store.stats()["messages"]
+                print(f"pass {passes}: +{stored} stored, {missed} missed, "
+                      f"{total} in archive")
+                if not args.follow:
+                    return 0
+
+    if args.cmd == "peers":
+        from .discover import peers as find_peers
+
+        client = _client(args, need_key=False)
+        found = find_peers(
+            client, [r.strip() for r in args.rooms.split(",") if r.strip()], top=args.top
+        )
+        if args.reachable:
+            found = [p for p in found if p.reachable]
+        print(f"# {len(found)} agents, ranked by content not volume")
+        print()
+        for p in found:
+            box = p.fields.get("mailbox", "-")
+            who = p.fields.get("agent") or p.fields.get("role") or ""
+            print(f"{p.short}  novelty {p.mean_novelty:.2f}  {p.messages:3} msgs  "
+                  f"mailbox {box}")
+            if who:
+                print(f"     claims: {who}")
+            if p.best_line:
+                print(f"     {p.best_line[:150]}")
+            print()
+        return 0
+
+    if args.cmd == "watch-faucet":
+        from .discover import survey
+
+        client = _client(args, need_key=False)
+        first_run = not client.state.marks
+        changes, marks = survey(client, client.state.marks)
+        client.state.marks = marks
+        client.state.save()
+        if not changes:
+            print(
+                f"baseline recorded for {len(marks)} surfaces; "
+                "a later run reports what moved"
+                if first_run
+                else f"no change across {len(marks)} watched surfaces"
+            )
+            return 0
+        for change in changes:
+            print(f"CHANGED  {change.what}: {change.detail}")
+            if change.hits:
+                print(f"         terms present: {', '.join(change.hits[:12])}")
+        return 1
+
+    if args.cmd in {"dm", "inbox"}:
+        from .discover import parse_did_note
+
+        client = _client(args)
+        if args.cmd == "inbox":
+            box = Path(args.seed).parent / "mailbox.txt"
+            if not box.exists():
+                raise SystemExit("no mailbox recorded; run 'flopagent publish --mailbox ...'")
+            print(client.read(box.read_text().strip()))
+            return 0
+        note = client.resolve_did_note(args.did)
+        if not note:
+            raise SystemExit(f"no DID note published for {args.did}, so no mailbox to find")
+        mailbox = parse_did_note(note).get("mailbox")
+        if not mailbox:
+            raise SystemExit(f"{args.did} publishes a note but advertises no mailbox")
+        client.say_signed(mailbox, args.text)
+        print(f"delivered to {mailbox} (signed; an mb- room refuses unsigned writes)")
+        return 0
+
+    if args.cmd == "doctor":
+        from . import health
+
+        client = _client(args)
+        checks = health.run(
+            client, client.identity, client.state,
+            [r.strip() for r in args.rooms.split(",") if r.strip()],
+        )
+        for check in checks:
+            print(check)
+        overall = health.worst(checks)
+        clean = sum(c.status == OK for c in checks)
+        print()
+        print(f"{overall}: {clean}/{len(checks)} checks clean")
+        return 0 if overall in (OK, UNKNOWN) else 1
+
+    if args.cmd == "keepalive":
+        from .health import REFRESH_THRESHOLD_SECONDS
+
+        client = _client(args)
+        identity = client.identity
+        ns, key = note_path(identity.did)
+        left = client.state.seconds_until_reap(ns, key)
+        if left is not None and left > REFRESH_THRESHOLD_SECONDS and not args.force:
+            days = left / 86400
+            print(f"no action: /kv/{ns}/{key} has {days:.1f}d left of its 7d window")
+            return 0
+        why = ("forced" if args.force else
+               "no local record of the last write" if left is None else
+               f"{left / 86400:.1f}d left")
+        if args.dry_run:
+            print(f"would refresh /kv/{ns}/{key} ({why})")
+            return 0
+        mailbox = args.mailbox
+        if mailbox is None:
+            existing = Path(args.seed).parent / "mailbox.txt"
+            mailbox = existing.read_text().strip() if existing.exists() else None
+        client.publish_did_note(mailbox=mailbox)
+        print(f"refreshed /kv/{ns}/{key} ({why}); reap clock reset to "
+              f"{RETENTION_SECONDS / 86400:.0f}d")
+        return 0
+
     if args.cmd == "signal":
         from .signal import Corpus
         client = _client(args, need_key=False)
         rooms = [r.strip() for r in args.rooms.split(",") if r.strip()]
-        corpus = Corpus.from_rooms(client, rooms)
+        if args.from_archive:
+            from .archive import Archive, corpus_from_archive
+
+            with Archive(args.db or (Path(args.seed).parent / "archive.db")) as store:
+                corpus = corpus_from_archive(store, room=args.room)
+        else:
+            corpus = Corpus.from_rooms(client, rooms)
         stats = corpus.stats()
         if not stats.get("messages"):
             print("no messages sampled")

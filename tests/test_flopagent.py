@@ -9,6 +9,7 @@ Run:  python -m unittest discover -s tests -v
 
 from __future__ import annotations
 
+import pathlib
 import unittest
 
 from flopagent.canon import (
@@ -396,3 +397,239 @@ class TestSignal(unittest.TestCase):
         stats = self._corpus().stats()
         self.assertEqual(stats["messages"], 25)
         self.assertGreater(stats["template_pct"], 80)
+
+
+class TestState(unittest.TestCase):
+    """The only record of when a note was written, because the server keeps none."""
+
+    def setUp(self):
+        import tempfile
+        from flopagent.state import State
+        self.dir = tempfile.mkdtemp()
+        self.path = pathlib.Path(self.dir) / "state.json"
+        self.State = State
+
+    def test_round_trip(self):
+        s = self.State(path=self.path)
+        s.note_written("did-18", "abc", when=1000.0)
+        s.room_written("lobby", when=1001.0)
+        s.receipt_issued("lobby", 5)
+        s.save()
+        again = self.State.load(self.path)
+        self.assertEqual(again.note_writes["did-18/abc"], 1000.0)
+        self.assertEqual(again.receipts, ["lobby:5"])
+
+    def test_unknown_is_none_not_zero(self):
+        # Reporting a confident wrong expiry is worse than admitting ignorance.
+        s = self.State(path=self.path)
+        self.assertIsNone(s.note_age("did-18", "never"))
+        self.assertIsNone(s.seconds_until_reap("did-18", "never"))
+
+    def test_reap_countdown(self):
+        import time as _t
+        s = self.State(path=self.path)
+        s.note_written("did-18", "abc", when=_t.time() - 6 * 86400)
+        left = s.seconds_until_reap("did-18", "abc")
+        self.assertAlmostEqual(left / 86400, 1.0, delta=0.05)
+
+    def test_expired_note_reports_negative(self):
+        import time as _t
+        s = self.State(path=self.path)
+        s.note_written("did-18", "abc", when=_t.time() - 9 * 86400)
+        self.assertLess(s.seconds_until_reap("did-18", "abc"), 0)
+
+    def test_corrupt_file_does_not_brick_the_client(self):
+        self.path.write_text("{not json", encoding="utf-8")
+        s = self.State.load(self.path)
+        self.assertEqual(s.note_writes, {})
+
+    def test_receipts_are_bounded(self):
+        s = self.State(path=self.path)
+        for i in range(600):
+            s.receipt_issued("lobby", i)
+        s.save()
+        self.assertEqual(len(self.State.load(self.path).receipts), 500)
+
+    def test_duplicate_receipts_are_not_double_recorded(self):
+        s = self.State(path=self.path)
+        s.receipt_issued("lobby", 5)
+        s.receipt_issued("lobby", 5)
+        self.assertEqual(s.receipts, ["lobby:5"])
+
+
+class TestDidNoteParsing(unittest.TestCase):
+    def test_parses_the_documented_shape(self):
+        from flopagent.discover import parse_did_note
+        f = parse_did_note(
+            "did:key:z6MkAbc mailbox:mb-p-deadbeef agent:flopagent x25519:Zm9v role:tools"
+        )
+        self.assertEqual(f["mailbox"], "mb-p-deadbeef")
+        self.assertEqual(f["agent"], "flopagent")
+        self.assertEqual(f["x25519"], "Zm9v")
+        self.assertNotIn("did", f)  # the DID itself is not a field
+
+    def test_malformed_notes_degrade_rather_than_raise(self):
+        from flopagent.discover import parse_did_note
+        for junk in ("", "   ", "no colons here", "::::", "mailbox:", "did:key:z6MkX"):
+            with self.subTest(note=junk):
+                self.assertIsInstance(parse_did_note(junk), dict)
+
+    def test_unknown_fields_are_ignored_not_trusted(self):
+        from flopagent.discover import parse_did_note
+        self.assertEqual(parse_did_note("evil:rm-rf admin:true"), {})
+
+
+class TestFaucetSignals(unittest.TestCase):
+    """A watcher that cries wolf gets muted before the one real announcement."""
+
+    def test_matches_the_terms_that_matter(self):
+        from flopagent.discover import SIGNALS
+        for s in ("faucet", "FLOP airdrop", "testnet criteria", "claim your allocation",
+                  "snapshot", "eligibility rules", "$FLOP", "genesis block"):
+            with self.subTest(text=s):
+                self.assertTrue(SIGNALS.search(s))
+
+    def test_does_not_fire_inside_longer_words(self):
+        # Every one of these appears in ordinary room names or chatter.
+        from flopagent.discover import SIGNALS
+        for s in ("monflop-node", "flopper", "flopside", "flopping",
+                  "reclaimed", "unclaimed", "proclaim"):
+            with self.subTest(text=s):
+                self.assertIsNone(SIGNALS.search(s))
+
+
+class TestHealthReporting(unittest.TestCase):
+    def test_humanise(self):
+        from flopagent.health import _humanise
+        self.assertEqual(_humanise(6 * 86400 + 3600), "6d 1h")
+        self.assertEqual(_humanise(7200), "2h")
+        self.assertIn("overdue", _humanise(-3600))
+
+    def test_worst_picks_the_most_severe(self):
+        from flopagent.health import Check, worst, OK, WARN, FAIL, UNKNOWN
+        self.assertEqual(worst([Check("a", OK, "")]), OK)
+        self.assertEqual(worst([Check("a", OK, ""), Check("b", WARN, "")]), WARN)
+        self.assertEqual(
+            worst([Check("a", WARN, ""), Check("b", FAIL, ""), Check("c", UNKNOWN, "")]),
+            FAIL,
+        )
+
+    def test_a_check_renders_its_remedy(self):
+        from flopagent.health import Check, FAIL
+        rendered = str(Check("did note", FAIL, "not published", "flopagent publish"))
+        self.assertIn("FAIL", rendered)
+        self.assertIn("-> flopagent publish", rendered)
+
+
+class _FakeClient:
+    """A room that grows, so the archiver can be tested without a network.
+
+    Mimics the read semantics that matter: ``since`` opens the window, ``limit``
+    keeps the NEWEST n of it (FINDINGS.md §8), which is exactly the behaviour that
+    creates gaps.
+    """
+
+    def __init__(self, room="lobby", count=0):
+        self.room = room
+        self.msgs = []
+        self.grow(count)
+
+    def grow(self, n):
+        start = len(self.msgs) + 1
+        for i in range(start, start + n):
+            self.msgs.append({
+                "seq": i, "ts": f"2026-08-26T00:00:{i % 60:02d}Z",
+                "from": f"did:key:zKey{i % 7}", "text": f"message {i}", "nonce": i,
+            })
+
+    def read(self, room, since=None, wait=None, limit=None, as_json=False):
+        window = [m for m in self.msgs if since is None or m["seq"] > since]
+        window = window[-(limit or 50):]          # newest n, not first n
+        return {"room": room, "messages": window,
+                "last_seq": window[-1]["seq"] if window else (since or 0)}
+
+
+class TestArchive(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        from flopagent.archive import Archive
+        self.dir = tempfile.mkdtemp()
+        self.store = Archive(pathlib.Path(self.dir) / "a.db")
+
+    def tearDown(self):
+        self.store.close()
+
+    def test_first_poll_stores_and_sets_a_cursor(self):
+        client = _FakeClient(count=10)
+        r = self.store.poll(client, "lobby")
+        self.assertEqual(r.stored, 10)
+        self.assertEqual(r.missed, 0)
+        self.assertEqual(self.store.cursor_for("lobby"), 10)
+
+    def test_reingesting_the_same_messages_is_idempotent(self):
+        client = _FakeClient(count=10)
+        self.store.poll(client, "lobby")
+        self.store.db.execute("UPDATE cursors SET last_seq = 0")
+        second = self.store.poll(client, "lobby")
+        self.assertEqual(second.stored, 0)
+        self.assertEqual(self.store.stats()["messages"], 10)
+
+    def test_a_gap_is_detected_and_recorded_not_hidden(self):
+        client = _FakeClient(count=10)
+        self.store.poll(client, "lobby")
+        client.grow(500)                      # more than one window can carry
+        r = self.store.poll(client, "lobby")
+        self.assertGreater(r.missed, 0)
+        gaps = self.store.gaps()
+        self.assertEqual(len(gaps), 1)
+        self.assertEqual(gaps[0]["lost"], r.missed)
+        self.assertEqual(self.store.stats()["missed_messages"], r.missed)
+
+    def test_a_backlog_beyond_one_window_is_lost_not_recovered(self):
+        """The honest limit: draining reaches the tail, it does not fetch the past.
+
+        The window `since` opens always ends at the tail, so a reader far behind
+        gets the newest 200 and nothing else exists to ask for. Believing drain
+        recovers a backlog would make every statistic from this archive wrong.
+        """
+        client = _FakeClient(count=10)
+        self.store.poll(client, "lobby")          # cursor at 10
+        client.grow(1000)                         # now 1010, we are 1000 behind
+        drained = self.store.drain(client, "lobby")
+        self.assertEqual(self.store.cursor_for("lobby"), 1010)   # at the tail
+        self.assertEqual(drained.stored, 200)                    # one window only
+        self.assertEqual(drained.missed, 800)                    # and it says so
+        self.assertEqual(self.store.stats()["missed_messages"], 800)
+
+    def test_draining_collects_what_lands_during_the_round_trip(self):
+        """What drain does buy: a second pass for messages that arrived mid-poll."""
+        class Growing(_FakeClient):
+            def read(self, *a, **kw):
+                out = super().read(*a, **kw)
+                self.grow(5)      # five more land while we were fetching
+                return out
+
+        client = Growing(count=10)
+        self.store.poll(client, "lobby")
+        before = self.store.stats()["messages"]
+        self.store.drain(client, "lobby")
+        self.assertGreater(self.store.stats()["messages"], before)
+
+    def test_drain_is_bounded(self):
+        client = _FakeClient(count=100000)
+        self.store.drain(client, "lobby")
+        # Bounded work per sweep, so one firehose cannot starve the other rooms.
+        self.assertLessEqual(self.store.stats()["messages"], 200 * self.store.MAX_DRAIN)
+
+    def test_stats_and_authors(self):
+        self.store.poll(_FakeClient(count=40), "lobby")
+        stats = self.store.stats()
+        self.assertEqual(stats["messages"], 40)
+        self.assertEqual(stats["keys"], 7)
+        self.assertTrue(self.store.top_authors())
+
+    def test_corpus_from_archive_feeds_the_template_test(self):
+        from flopagent.archive import corpus_from_archive
+        self.store.poll(_FakeClient(count=40), "lobby")
+        corpus = corpus_from_archive(self.store)
+        self.assertEqual(len(corpus.messages), 40)

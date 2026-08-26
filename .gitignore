@@ -1,5 +1,7 @@
 # The seed IS the identity and the airdrop address. Never commit it.
 identity/
+*.db
+state.json
 *.seed
 *.hex
 
