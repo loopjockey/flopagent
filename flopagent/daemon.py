@@ -27,8 +27,11 @@ arrives anyway.
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field
+
+from pathlib import Path
 
 from .archive import Archive
 from .canon import CanonError, check_name
@@ -43,6 +46,10 @@ HEARTBEAT_EVERY = 300
 BROADCAST_EVERY = 3 * 3600
 FAUCET_EVERY = 900
 KEEPALIVE_EVERY = 3600
+#: Deliberately slow, with a low cap. Being wrong at volume is the failure mode
+#: that would discredit the rest of what this client publishes, and most cycles
+#: correctly find nothing to say.
+ASSIST_EVERY = 1200
 
 
 @dataclass
@@ -68,13 +75,14 @@ class Daemon:
     stored: int = 0
     missed: int = 0
     writes: int = 0
+    _assistant: object = None
 
     def __post_init__(self) -> None:
         check_name(self.nick, "nick")
         for name, period in (
             ("index", INDEX_EVERY), ("heartbeat", HEARTBEAT_EVERY),
             ("faucet", FAUCET_EVERY), ("keepalive", KEEPALIVE_EVERY),
-            ("broadcast", BROADCAST_EVERY),
+            ("assist", ASSIST_EVERY), ("broadcast", BROADCAST_EVERY),
         ):
             self.jobs[name] = Job(name, period)
 
@@ -151,6 +159,26 @@ class Daemon:
         self.writes += 1
         return "refreshed"
 
+    def do_assist(self) -> str:
+        """Answer messages there is a verified answer for. Usually: nothing."""
+        from .archive import corpus_from_archive
+        from .assist import Assistant
+
+        state = self.client.state
+        answered = set(state.marks.get("answered", "").split("|")) - {""}
+        corpus = corpus_from_archive(self.archive)
+        done = self.assistant.act(self.client, corpus, self.client.identity.did,
+                                  answered)
+        if not done:
+            return "nothing answerable"
+        state.marks["answered"] = "|".join(sorted(answered))[-7000:]
+        state.save()
+        self.writes += len(done) * 2          # message + receipt
+        for candidate, _ in done:
+            print(f"    helped /r/{candidate.room}#{candidate.seq} "
+                  f"[{candidate.answer.key}]")
+        return f"{len(done)} answered"
+
     def do_broadcast(self) -> str:
         from .archive import corpus_from_archive
         from .broadcast import publish
@@ -165,6 +193,14 @@ class Daemon:
         self.writes += len(parts)
         return f"{len(parts)} notes from {len(corpus.messages)} messages"
 
+    @property
+    def assistant(self):
+        from .assist import Assistant
+
+        if self._assistant is None:
+            self._assistant = Assistant(max_per_run=2, max_per_room_per_run=1)
+        return self._assistant
+
     def _mailbox(self) -> str | None:
         from pathlib import Path
 
@@ -177,7 +213,8 @@ class Daemon:
         """Run whatever is due. Returns one line per job that ran."""
         now = time.time() if now is None else now
         lines: list[str] = []
-        for name in ("index", "heartbeat", "faucet", "keepalive", "broadcast"):
+        for name in ("index", "heartbeat", "faucet", "keepalive", "assist",
+                     "broadcast"):
             job = self.jobs[name]
             if not job.due(now):
                 continue
@@ -196,8 +233,26 @@ class Daemon:
             lines.append(f"{name}: {detail}")
         return lines
 
-    def run(self, cycles: int | None = None, sleep: float = 5.0) -> None:
-        """Loop until interrupted, or for ``cycles`` ticks when testing."""
+    def run(self, cycles: int | None = None, sleep: float = 5.0,
+            lock: Path | None = None) -> None:
+        """Loop until interrupted, or for ``cycles`` ticks when testing.
+
+        A second instance is refused. Two daemons do not merely duplicate the
+        heartbeat writes: each holds its own in-memory state for hours, and the
+        stale one erases the fresher one's record of what it has already answered
+        -- which cost a duplicate public reply before this existed. `State.save`
+        now merges rather than clobbers, so the lock is the second line of
+        defence rather than the only one.
+        """
+        if lock is not None:
+            if lock.exists():
+                age = time.time() - lock.stat().st_mtime
+                if age < 600:
+                    raise SystemExit(
+                        f"another daemon holds {lock} (touched {age:.0f}s ago). "
+                        "Stop it first, or delete the lock if it died."
+                    )
+            lock.write_text(str(os.getpid()), encoding="utf-8")
         count = 0
         while cycles is None or count < cycles:
             for line in self.tick():
@@ -206,5 +261,7 @@ class Daemon:
             if pause:
                 print(f"  pacing: budget low, sleeping {pause:.0f}s")
                 time.sleep(pause)
+            if lock is not None:
+                lock.touch()          # liveness, so a crashed daemon frees it
             time.sleep(sleep)
             count += 1

@@ -73,8 +73,20 @@ class State:
         )
 
     def save(self) -> None:
-        """Atomic replace, so a crash mid-write cannot leave a truncated file."""
+        """Atomic replace, merging with whatever is on disk first.
+
+        Two processes sharing this file is not hypothetical -- a long-running
+        daemon and a one-off CLI command is the ordinary case, and the daemon
+        holds an in-memory copy for hours. A plain overwrite lets the stale writer
+        clobber the fresh one, which is not a lost convenience: it cost a duplicate
+        public reply when a daemon erased the record of a message the CLI had just
+        answered. Last-write-wins is wrong here, so merge.
+
+        Timestamps take the newest value and sets take the union, because both
+        record "this happened" and neither is ever undone by another writer.
+        """
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._merge_from_disk()
         payload = {
             "version": 1,
             "note_writes": self.note_writes,
@@ -85,6 +97,31 @@ class State:
         tmp = self.path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload, indent=1, sort_keys=True), encoding="utf-8")
         os.replace(tmp, self.path)
+
+    def _merge_from_disk(self) -> None:
+        """Fold any concurrent writer's record into ours before we replace the file."""
+        if not self.path.exists():
+            return
+        try:
+            other = json.loads(self.path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return
+        for field_name in ("note_writes", "room_writes"):
+            mine = getattr(self, field_name)
+            for key, stamp in (other.get(field_name) or {}).items():
+                if stamp > mine.get(key, 0):
+                    mine[key] = stamp        # newest write wins; a write is a fact
+        for marker in other.get("receipts") or []:
+            if marker not in self.receipts:
+                self.receipts.append(marker)
+        for key, value in (other.get("marks") or {}).items():
+            if key == "answered":
+                # A union: a message answered by either process is answered.
+                merged = set(filter(None, value.split("|")))
+                merged |= set(filter(None, self.marks.get(key, "").split("|")))
+                self.marks[key] = "|".join(sorted(merged))
+            elif key not in self.marks:
+                self.marks[key] = value
 
     # ---- recording -------------------------------------------------------
 

@@ -138,6 +138,13 @@ def main(argv: list[str] | None = None) -> int:
     rn.add_argument("--cycles", type=int, default=None, help="stop after N ticks")
     rn.add_argument("--db", default=None)
 
+    asst = sub.add_parser(
+        "assist", help="answer messages this client has a verified answer for"
+    )
+    asst.add_argument("--dry-run", action="store_true")
+    asst.add_argument("--max", type=int, default=3)
+    asst.add_argument("--db", default=None)
+
     bc = sub.add_parser(
         "broadcast",
         help="publish the template index, digest and peer directory as notes any "
@@ -275,10 +282,35 @@ def _dispatch(args) -> int:
                   f"heartbeat/{d.jobs['heartbeat'].period}s "
                   f"broadcast/{d.jobs['broadcast'].period}s. ctrl-c to stop.")
             try:
-                d.run(cycles=args.cycles)
+                d.run(cycles=args.cycles,
+                      lock=Path(args.seed).parent / "daemon.lock")
             except KeyboardInterrupt:
                 pass
             print(f"stored {d.stored}, missed {d.missed}, writes {d.writes}")
+        return 0
+
+    if args.cmd == "assist":
+        from .archive import Archive, corpus_from_archive
+        from .assist import Assistant
+
+        client = _client(args)
+        with Archive(args.db or (Path(args.seed).parent / "archive.db")) as store:
+            corpus = corpus_from_archive(store)
+        answered = set(client.state.marks.get("answered", "").split("|")) - {""}
+        assistant = Assistant(max_per_run=args.max)
+        done = assistant.act(client, corpus, client.identity.did, answered,
+                             dry_run=args.dry_run)
+        if not done:
+            print("nothing answerable right now (silence is the common case)")
+            return 0
+        for candidate, text in done:
+            print(f"{'WOULD REPLY' if args.dry_run else 'REPLIED'} "
+                  f"/r/{candidate.room}#{candidate.seq} [{candidate.answer.key}]")
+            print(f"  {text[:300]}")
+            print()
+        if not args.dry_run:
+            client.state.marks["answered"] = "|".join(sorted(answered))[-7000:]
+            client.state.save()
         return 0
 
     if args.cmd == "broadcast":
