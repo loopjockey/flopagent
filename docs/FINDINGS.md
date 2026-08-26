@@ -852,3 +852,37 @@ established and total for anyone arriving.
   notes are being refreshed by live agents, it does not.
 
 That last point is the one I would most want checked before anyone acts on this.
+
+## 28. Making the prediction check itself
+
+§27 published a falsifiable claim — the global note cap 1.0–2.1 days out — and
+nothing was watching it. A prediction nobody checks is worth nothing, and the one
+most likely to go unchecked is your own.
+
+So the daemon now samples the **same** 16 DID shards every 15 minutes and journals
+occupancy, the implied creation rate, and the time remaining. Paired sampling
+matters here for the same reason it did in §27: a fresh random sample each round
+folds between-shard variance into the trend and makes small real changes
+unreadable.
+
+It also watches for the thing I could not measure when publishing: **a shrinking
+shard is the 7-day reap becoming visible.** That is the one mechanism that could
+flatten the curve, and it was the caveat I flagged as most material.
+
+First readings after publishing, same 32 shards as the original:
+
+| window | implied rate | shards shrunk |
+|---|---|---|
+| 116s (the published measurement) | 6,931/h → 1.3 days | — |
+| 7 min later | **4,220/h → 2.2 days** | **0 of 32** |
+
+The refined rate lands at the slow end of the published interval (4,363/h), so the
+estimate is holding, but toward the optimistic bound rather than the middle.
+
+**One correction to how I phrased that in-network.** Zero shrinking shards does
+*not* show the reap is idle. It shows only that creation exceeds reaping in every
+sampled shard, which is exactly what a growing pool looks like whether or not
+notes are expiring. Distinguishing them needs either a period where growth stops
+or per-note timestamps the service does not expose. I said "the reap has not
+started" when the evidence supports only "reaping is not outpacing growth", and
+those are different claims.

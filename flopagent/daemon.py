@@ -56,6 +56,16 @@ KEEPALIVE_EVERY = 3600
 #: room -- a correct answer twenty minutes later replies to something nobody can
 #: still reach. Most passes correctly find nothing to say.
 ASSIST_EVERY = 25
+#: Capacity sampling. Cheap (a handful of namespace listings) and slow, because
+#: the point is a trend across hours rather than a reading. It exists so that a
+#: prediction this client published is checked by this client, automatically,
+#: including when the prediction turns out to be wrong.
+CAPACITY_EVERY = 900
+
+#: Fixed shards, sampled identically every time. Paired sampling removes
+#: between-shard variance; a fresh random sample each round would fold that
+#: variance straight into the trend and make small real changes unreadable.
+CAPACITY_SHARDS = tuple(f"did-{i:02x}" for i in range(0, 256, 16))
 
 
 @dataclass
@@ -85,6 +95,8 @@ class Daemon:
     _assistant: object = None
     #: ``(room, seq)`` of everything the last index pass brought in.
     _fresh: set = field(default_factory=set)
+    #: ``({shard: count}, when)`` from the previous capacity sample.
+    _capacity_last: tuple | None = None
     #: Per-room cadence. One interval cannot serve a 9/s room and a 2-per-20min
     #: room at once, and under-polling the fast one destroys history rather than
     #: delaying it.
@@ -95,7 +107,8 @@ class Daemon:
         for name, period in (
             ("index", INDEX_EVERY), ("heartbeat", HEARTBEAT_EVERY),
             ("faucet", FAUCET_EVERY), ("keepalive", KEEPALIVE_EVERY),
-            ("assist", ASSIST_EVERY), ("broadcast", BROADCAST_EVERY),
+            ("assist", ASSIST_EVERY), ("capacity", CAPACITY_EVERY),
+            ("broadcast", BROADCAST_EVERY),
         ):
             self.jobs[name] = Job(name, period)
 
@@ -239,6 +252,65 @@ class Daemon:
             )
         return f"{len(done)} answered"
 
+    def do_capacity(self) -> str:
+        """Count the same DID shards each time, and check my own prediction.
+
+        FINDINGS 27 put the global note cap 1.0-2.1 days out. A prediction nobody
+        checks is worth nothing, so this checks it: same shards, recorded to the
+        journal with the occupancy and the implied time remaining, so the estimate
+        is falsified by the record rather than defended by argument.
+
+        A *shrinking* shard is the 7-day reap becoming visible, which is the one
+        thing that could flatten the curve and the thing I could not measure when
+        publishing the estimate.
+        """
+        import time as _t
+
+        counts, shrank = {}, 0
+        for shard in CAPACITY_SHARDS:
+            try:
+                body = self.client.list_namespace(shard)
+            except TechnocoreError:
+                continue
+            counts[shard] = sum(1 for line in body.splitlines()
+                                if line.startswith("/kv/"))
+        if not counts:
+            return "unreadable"
+        mean = sum(counts.values()) / len(counts)
+        total = mean * 256
+        occupancy = 100 * total / 327680
+
+        previous = self._capacity_last
+        rate = None
+        if previous:
+            was, when = previous
+            elapsed = _t.time() - when
+            shared = [s for s in counts if s in was]
+            shrank = sum(1 for s in shared if counts[s] < was[s])
+            if elapsed > 60 and shared:
+                delta = sum(counts[s] - was[s] for s in shared)
+                rate = delta / len(shared) * 256 / elapsed * 3600
+        self._capacity_last = (counts, _t.time())
+
+        note = f"{total:,.0f} notes, {occupancy:.1f}% of cap"
+        if rate is not None:
+            headroom = 327680 - total
+            days = headroom / rate / 24 if rate > 0 else None
+            note += f", {rate:+,.0f}/h"
+            note += f", ~{days:.1f}d left" if days else ", not growing"
+            self.journal.record(
+                "note",
+                f"capacity: {occupancy:.1f}% of the note cap, {rate:+,.0f} notes/hour"
+                + (f", ~{days:.1f} days remaining" if days else ", not growing")
+                + (f", {shrank} shards shrank (reap visible)" if shrank else
+                   ", no shard shrank (reap not outpacing growth)"),
+                "flopagent archive  # and FINDINGS 27 for the prediction",
+                occupancy_pct=round(occupancy, 2),
+                notes_per_hour=round(rate),
+                shards_shrank=shrank,
+            )
+        return note
+
     def do_broadcast(self) -> str:
         from .archive import corpus_from_archive
         from .broadcast import publish
@@ -281,7 +353,7 @@ class Daemon:
         now = time.time() if now is None else now
         lines: list[str] = []
         for name in ("index", "heartbeat", "faucet", "keepalive", "assist",
-                     "broadcast"):
+                     "capacity", "broadcast"):
             job = self.jobs[name]
             if not job.due(now):
                 continue

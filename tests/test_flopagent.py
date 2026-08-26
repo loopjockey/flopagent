@@ -1495,3 +1495,66 @@ class TestSelfHealingDedup(unittest.TestCase):
         from flopagent.assist import Assistant
         found = Assistant().find(self._corpus(), "did:key:zMe", set())
         self.assertEqual([c.answer.key for c in found], ["pipe-delimiter"])
+
+
+class TestCapacityMonitor(unittest.TestCase):
+    """A published prediction that nothing checks is worth nothing.
+
+    FINDINGS 27 put the note cap 1.0-2.1 days out. This records the occupancy and
+    implied remaining time on a schedule, so the estimate is falsified by the
+    record rather than defended by argument.
+    """
+
+    def _daemon(self, shard_counts):
+        import tempfile
+        from flopagent.archive import Archive
+        from flopagent.daemon import Daemon
+        from flopagent.journal import Journal
+
+        tmp = pathlib.Path(tempfile.mkdtemp())
+
+        class StubClient:
+            def __init__(self):
+                self.counts = shard_counts
+            def list_namespace(self, ns):
+                n = self.counts.get(ns, 0)
+                return "\n".join(f"/kv/{ns}/k{i}" for i in range(n))
+
+        return Daemon(client=StubClient(), archive=Archive(tmp / "a.db"),
+                      rooms=["lobby"], journal=Journal(tmp / "j.jsonl"))
+
+    def test_first_sample_reports_occupancy_without_a_rate(self):
+        from flopagent.daemon import CAPACITY_SHARDS
+        d = self._daemon({s: 400 for s in CAPACITY_SHARDS})
+        note = d.do_capacity()
+        self.assertIn("% of cap", note)
+        self.assertNotIn("/h", note)          # no rate without a prior sample
+        self.assertEqual(d.journal.entries(), [])
+
+    def test_growth_between_samples_yields_a_rate_and_a_journal_entry(self):
+        import time
+        from flopagent.daemon import CAPACITY_SHARDS
+        d = self._daemon({s: 400 for s in CAPACITY_SHARDS})
+        d.do_capacity()
+        d._capacity_last = (d._capacity_last[0], time.time() - 3600)   # an hour ago
+        d.client.counts = {s: 410 for s in CAPACITY_SHARDS}            # +10 each
+        note = d.do_capacity()
+        self.assertIn("/h", note)
+        self.assertIn("d left", note)
+        entry = d.journal.entries()[-1]
+        self.assertEqual(entry["kind"], "note")
+        self.assertGreater(entry["notes_per_hour"], 0)
+        self.assertEqual(entry["shards_shrank"], 0)
+
+    def test_a_shrinking_shard_is_recorded_as_the_reap_becoming_visible(self):
+        import time
+        from flopagent.daemon import CAPACITY_SHARDS
+        d = self._daemon({s: 400 for s in CAPACITY_SHARDS})
+        d.do_capacity()
+        d._capacity_last = (d._capacity_last[0], time.time() - 3600)
+        d.client.counts = {s: 390 for s in CAPACITY_SHARDS}            # shrinking
+        d.do_capacity()
+        entry = d.journal.entries()[-1]
+        self.assertGreater(entry["shards_shrank"], 0)
+        self.assertIn("reap visible", entry["what"])
+        self.assertIn("not growing", entry["what"])
