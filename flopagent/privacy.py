@@ -34,6 +34,9 @@ from urllib.parse import unquote
 
 DENY_FILE = "privacy.deny"
 
+#: The service's name grammar, used to tell a published room name from a secret.
+NAME_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,47}")
+
 
 class PrivacyError(RuntimeError):
     """Outbound content matched a privacy rule. The request was not made."""
@@ -111,14 +114,42 @@ class Redactor:
     def add(self, literal: str, reason: str = "an explicitly blocked value") -> None:
         self.extra.append((literal, reason))
 
+    @staticmethod
+    def _is_name(haystack: str, start: int, end: int) -> bool:
+        """True if a match sits inside a token that is a legal room or note name.
+
+        The name grammar is ``^[a-z0-9][a-z0-9_-]{0,47}$``, so `mb-p-<32 hex>` is a
+        room somebody published, not key material. Judging the containing token is
+        exact; raising the hex threshold would have been a guess that traded real
+        protection for one false positive.
+        """
+        left = start
+        while left > 0 and (haystack[left - 1].isalnum() or haystack[left - 1] in "-_"):
+            left -= 1
+        right = end
+        while right < len(haystack) and (haystack[right].isalnum()
+                                         or haystack[right] in "-_"):
+            right += 1
+        token = haystack[left:right]
+        return bool(NAME_RE.fullmatch(token)) and token != haystack[start:end]
+
     def findings(self, text: str) -> list[str]:
         """Every reason ``text`` must not be sent. Empty means it is clear."""
         if not self.enabled:
             return []
-        # Scan the decoded form: text reaches the wire percent-encoded, so a name
-        # hidden as '%6adoe' is the same leak as a plain 'jdoe'. Never write a real
-        # local identifier into this file as an example -- that is itself a leak.
-        haystacks = {text, unquote(text)}
+        # Scan the DECODED form only. Decoding is not a second pass on top of the
+        # raw one, it subsumes it: unquote leaves an unencoded string unchanged, so
+        # a plain 'jdoe' and a hidden '%6adoe' both surface here.
+        #
+        # Scanning the raw form as well actively broke things. In a percent-encoded
+        # URL a mailbox arrives as `%3Dmb-p-<32 hex>`, and the token walk in
+        # `_is_name` then sees `3Dmb-p-...` -- uppercase, so not a legal name, so
+        # the exclusion did not apply and a legitimate feed publish was refused.
+        # The raw pass added no protection and one false positive.
+        #
+        # Never write a real local identifier into this file as an example: that
+        # would itself be the leak this module exists to prevent.
+        haystacks = {unquote(text)}
         reasons: list[str] = []
         for haystack in haystacks:
             lowered = haystack.lower()
@@ -126,8 +157,12 @@ class Redactor:
                 if literal.lower() in lowered and reason not in reasons:
                     reasons.append(reason)
             for pattern, reason in self.patterns:
-                if pattern.search(haystack) and reason not in reasons:
-                    reasons.append(reason)
+                for match in pattern.finditer(haystack):
+                    if self._is_name(haystack, match.start(), match.end()):
+                        continue     # a published room name, not a secret
+                    if reason not in reasons:
+                        reasons.append(reason)
+                    break
         return reasons
 
     def guard(self, text: str, what: str = "this request") -> None:

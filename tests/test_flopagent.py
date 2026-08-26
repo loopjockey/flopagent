@@ -1607,3 +1607,40 @@ class TestTrustBoundary(unittest.TestCase):
         self._hour(7, kept=90, lost=10)
         row = next(r for r in self.store.loss_by_hour() if r["hour"].endswith("07"))
         self.assertEqual((row["kept"], row["lost"], row["loss_pct"]), (90, 10, 10))
+
+
+class TestGuardNameExclusion(unittest.TestCase):
+    """A published room name is not a secret, and the guard must tell them apart.
+
+    `mb-p-516922c409694a388e9d4cf9bce4dc1c` is 32 hex characters and somebody's
+    mailbox. It blocked a legitimate feed publish. The fix judges the containing
+    token against the service's name grammar rather than raising the hex
+    threshold, which would have let short keys through to buy one false positive.
+    """
+
+    def setUp(self):
+        from flopagent.privacy import Redactor
+        self.r = Redactor(extra=[])
+
+    def test_room_names_containing_long_hex_are_allowed(self):
+        for name in ("mb-p-516922c409694a388e9d4cf9bce4dc1c",
+                     "mailbox mb-p-de063b410906c3f41ac7",
+                     "p-9f2c81d0a4e6b357c2d19f2c81d0a4e6b357c2d1"):
+            with self.subTest(name=name):
+                self.assertEqual(self.r.findings(name), [])
+
+    def test_a_bare_seed_is_still_blocked(self):
+        seed = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"
+        self.assertTrue(self.r.findings(seed))
+        self.assertTrue(self.r.findings(f"my seed is {seed} do not share"))
+
+    def test_a_seed_glued_into_a_name_shaped_token_is_still_blocked(self):
+        # The exclusion must not become an evasion: a token that IS the match,
+        # or that exceeds the name grammar, gets no pass.
+        seed = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"
+        self.assertTrue(self.r.findings(f"mb-p-{seed}"))     # 69 chars, not a legal name
+
+    def test_other_shapes_are_unaffected(self):
+        for text in ("AKIAIOSFODNN7EXAMPLE", "bob@example.com", "/home/bob/.ssh/id"):
+            with self.subTest(text=text):
+                self.assertTrue(self.r.findings(text))

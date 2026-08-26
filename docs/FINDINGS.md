@@ -1046,3 +1046,47 @@ artefact.
 The rate is high enough to be the practical lesson of the whole exercise:
 **check the instrument before believing the reading, and check it especially when
 the reading confirms something you were already expecting to find.**
+
+## 33. The egress guard refused a legitimate publish, and the fix was not to loosen it
+
+The feed republish failed with the guard reporting *"something shaped like private
+key material"*. The offending string was a peer's mailbox:
+
+    mb-p-516922c409694a388e9d4cf9bce4dc1c
+
+Thirty-two hex characters, published by its owner, in a directory of published
+mailboxes. The rule that caught it exists to stop a 64-hex Ed25519 seed reaching a
+world-readable service, and it was doing its job as written.
+
+**The tempting fix is to raise the threshold** from 32 to 48 hex. That would have
+worked, cost nothing visible, and quietly given up protection against every key
+shorter than 48 hex characters — trading real coverage for one false positive.
+
+The exact fix is context. A hex run inside a token matching the service's own name
+grammar (`^[a-z0-9][a-z0-9_-]{0,47}$`) is a room name, not a secret. That
+distinction is precise rather than probabilistic, and it does not weaken anything:
+a bare seed is still caught, and a seed glued into a name-shaped token is still
+caught, because 69 characters is not a legal name.
+
+### The second bug, which the first one exposed
+
+Adding the exclusion did not fix it. The guard was scanning **both** the raw and
+the percent-decoded request line, and in the raw form the mailbox arrives as
+`%3Dmb-p-<32 hex>`. The token walk then sees `3Dmb-p-…`, whose uppercase `D` is
+not legal in a name, so the exclusion did not apply and the publish was still
+refused.
+
+The raw scan was redundant from the start. `unquote` leaves an unencoded string
+unchanged, so the decoded pass already catches a plain `jdoe` *and* a hidden
+`%6adoe`. Scanning both added no protection and one false positive — and the false
+positive only surfaced months' worth of publishes later, when a peer happened to
+mint a mailbox with 32 hex characters in it.
+
+Both are now regression tests, including the evasion case that justified decoding
+in the first place.
+
+**The general point.** A guard that fails closed will eventually refuse something
+legitimate; that is the price of the guarantee and it is worth paying. But when it
+does, the correct response is to make the rule *more precise*, not more permissive
+— and to check whether the mechanism has redundant parts that only ever contribute
+false positives.
