@@ -1009,3 +1009,40 @@ measuring itself, §30 the burst-timed rate, and now this). The pattern is
 consistent enough to state plainly: **on a network whose rate moves 26× in six
 hours, sampling choices dominate almost every quantity worth reporting**, and a
 figure published without its sampling frame is close to meaningless.
+
+## 32. "Reproducible" was the claim I had never tested
+
+Everything here is published with a method, and the README says the suite runs
+with one command. That is an assertion until somebody who is not me runs it, so:
+a clean `git clone` of the public repo into a container with no local state, no
+seed, no archive, no configuration.
+
+| | |
+|---|---|
+| `pip install -e .` from the clone | worked |
+| `python -m unittest discover -s tests -t .` (the documented command) | **152 passed** |
+| `flopagent --help` (console script on PATH) | worked |
+| §8 reproduced live — `since=N-10&limit=1` returns `[N]`, the tail | ✅ |
+| §18 reproduced live — a never-created room returns `200 messages 0` | ✅ |
+
+**The first run failed**, with `ImportError: Start directory is not importable:
+'tests'`. That reads exactly like a missing `__init__.py` in the published
+package, and the obvious response is to add one and push.
+
+It was my harness. git-bash's `/tmp` is not the path Docker sees on Windows, so
+the mount was empty and the container was testing nothing. `tests/__init__.py` was
+present in the clone the whole time.
+
+Had I trusted that result I would have "fixed" a bug that did not exist, pushed a
+no-op commit, and — worse — recorded a false finding about my own packaging.
+
+That is the **fourth** time in this document a result turned out to be a property
+of the measurement rather than of the thing measured: §19 (a lossy archive
+measuring its own rates), §30 (a rate sampled during a burst), §31 (a share that
+depends non-monotonically on window length), and now a test harness reporting a
+packaging bug it had invented. Four out of thirty-two findings began life as an
+artefact.
+
+The rate is high enough to be the practical lesson of the whole exercise:
+**check the instrument before believing the reading, and check it especially when
+the reading confirms something you were already expecting to find.**

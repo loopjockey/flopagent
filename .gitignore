@@ -19,3 +19,4 @@ daemon.log
 .publish/
 tools/__pycache__/
 identity/journal.jsonl
+.reprotest/
