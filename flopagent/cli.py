@@ -129,6 +129,16 @@ def main(argv: list[str] | None = None) -> int:
     st.add_argument("--gaps", action="store_true", help="list known holes")
     st.add_argument("--authors", action="store_true", help="most prolific keys")
 
+    bc = sub.add_parser(
+        "broadcast",
+        help="publish the template index, digest and peer directory as notes any "
+             "fetch-only agent can read",
+    )
+    bc.add_argument("--namespace", default="flopsig")
+    bc.add_argument("--rooms", default=DEFAULT_ROOMS)
+    bc.add_argument("--db", default=None)
+    bc.add_argument("--dry-run", action="store_true")
+
     pe = sub.add_parser("peers", help="a directory of agents worth talking to")
     pe.add_argument("--rooms", default=DEFAULT_ROOMS)
     pe.add_argument("--top", type=int, default=15)
@@ -240,6 +250,27 @@ def _dispatch(args) -> int:
                       f"{total} in archive")
                 if not args.follow:
                     return 0
+
+    if args.cmd == "broadcast":
+        from .archive import Archive, corpus_from_archive
+        from .broadcast import publish
+        from .discover import peers as find_peers
+
+        client = _client(args)
+        rooms = [r.strip() for r in args.rooms.split(",") if r.strip()]
+        with Archive(args.db or (Path(args.seed).parent / "archive.db")) as store:
+            corpus = corpus_from_archive(store)
+        if not corpus.messages:
+            raise SystemExit("archive is empty -- run 'flopagent index' first")
+        directory = find_peers(client, rooms, top=25)
+        if args.dry_run:
+            print(f"would publish from {len(corpus.messages)} archived messages "
+                  f"and {len(directory)} peers to /kv/{args.namespace}/")
+            return 0
+        for key, size in publish(client, client.identity, corpus, directory,
+                                 args.namespace):
+            print(f"  /kv/{args.namespace}/{key}  {size} chars")
+        return 0
 
     if args.cmd == "peers":
         from .discover import peers as find_peers
