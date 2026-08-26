@@ -56,6 +56,9 @@ KEEPALIVE_EVERY = 3600
 #: room -- a correct answer twenty minutes later replies to something nobody can
 #: still reach. Most passes correctly find nothing to say.
 ASSIST_EVERY = 25
+#: Answering queries runs on the same cadence as assist: a query is a question
+#: someone is waiting on, and the addressable window is seconds on a busy room.
+SERVE_EVERY = 25
 #: Capacity sampling. Cheap (a handful of namespace listings) and slow, because
 #: the point is a trend across hours rather than a reading. It exists so that a
 #: prediction this client published is checked by this client, automatically,
@@ -97,6 +100,9 @@ class Daemon:
     _fresh: set = field(default_factory=set)
     #: ``({shard: count}, when)`` from the previous capacity sample.
     _capacity_last: tuple | None = None
+    #: Per-DID query budget, so the service cannot be turned into a flood.
+    quota: object = field(default_factory=lambda: __import__(
+        "flopagent.serve", fromlist=["Quota"]).Quota())
     #: Per-room cadence. One interval cannot serve a 9/s room and a 2-per-20min
     #: room at once, and under-polling the fast one destroys history rather than
     #: delaying it.
@@ -107,7 +113,8 @@ class Daemon:
         for name, period in (
             ("index", INDEX_EVERY), ("heartbeat", HEARTBEAT_EVERY),
             ("faucet", FAUCET_EVERY), ("keepalive", KEEPALIVE_EVERY),
-            ("assist", ASSIST_EVERY), ("capacity", CAPACITY_EVERY),
+            ("assist", ASSIST_EVERY), ("serve", SERVE_EVERY),
+            ("capacity", CAPACITY_EVERY),
             ("broadcast", BROADCAST_EVERY),
         ):
             self.jobs[name] = Job(name, period)
@@ -252,6 +259,53 @@ class Daemon:
             )
         return f"{len(done)} answered"
 
+    def do_serve(self) -> str:
+        """Answer `FLOPAGENT: ...` queries from other agents, in their room.
+
+        Only signed queries: an answer about "your key" means nothing if anyone
+        can ask as anyone. Only fresh messages, because a query is a question
+        somebody is waiting on and the window it can be read in is seconds.
+        """
+        from .archive import corpus_from_archive
+        from .serve import parse, respond
+
+        if not self._fresh:
+            return "no new messages"
+        rows = []
+        for room, seq in self._fresh:
+            row = self.archive.db.execute(
+                "SELECT room, seq, author, text FROM messages WHERE room=? AND seq=?",
+                (room, seq)).fetchone()
+            if row and row["author"] and row["author"].startswith("did:key:"):
+                rows.append(row)
+        queries = [(r, parse(r["text"] or "")) for r in rows]
+        queries = [(r, q) for r, q in queries if q]
+        if not queries:
+            return "no queries"
+
+        corpus = corpus_from_archive(self.archive, limit=60000)
+        served = 0
+        for row, (verb, argument) in queries:
+            asker = row["author"]
+            if asker == self.client.identity.did:
+                continue                       # never answer ourselves
+            if not self.quota.allow(asker):
+                continue                       # silently, so the limit is not a megaphone
+            reply = respond(self.client, self.archive, corpus, verb, argument, asker)
+            short = asker[len("did:key:"):][:9]
+            try:
+                self.client.say_signed(row["room"], f"@{short} {reply}"[:4000])
+            except (TechnocoreError, CanonError):
+                continue
+            served += 1
+            self.writes += 1
+            self.journal.record(
+                "helped",
+                f"answered a FLOPAGENT: {verb} query from {short} in /r/{row['room']}",
+                f"flopagent read {row['room']}",
+            )
+        return f"{served} answered" if served else "none allowed"
+
     def do_capacity(self) -> str:
         """Count the same DID shards each time, and check my own prediction.
 
@@ -353,7 +407,7 @@ class Daemon:
         now = time.time() if now is None else now
         lines: list[str] = []
         for name in ("index", "heartbeat", "faucet", "keepalive", "assist",
-                     "capacity", "broadcast"):
+                     "serve", "capacity", "broadcast"):
             job = self.jobs[name]
             if not job.due(now):
                 continue

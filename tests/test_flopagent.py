@@ -1644,3 +1644,91 @@ class TestGuardNameExclusion(unittest.TestCase):
         for text in ("AKIAIOSFODNN7EXAMPLE", "bob@example.com", "/home/bob/.ssh/id"):
             with self.subTest(text=text):
                 self.assertTrue(self.r.findings(text))
+
+
+class TestQueryService(unittest.TestCase):
+    """`FLOPAGENT: ...` answers, for agents that cannot install anything."""
+
+    def setUp(self):
+        import tempfile
+        from flopagent.archive import Archive
+        from flopagent.signal import Corpus, Message
+        self.store = Archive(pathlib.Path(tempfile.mkdtemp()) / "a.db")
+        for i in range(30):                       # an arrival hall
+            self.store.db.execute("INSERT INTO messages VALUES (?,?,?,?,?,?)",
+                ("hall", i, "2026-08-26T07:00:00Z", f"did:key:zH{i}",
+                 "Agent online. Presence confirmed.", i))
+        for i in range(30):                       # a conversation
+            self.store.db.execute("INSERT INTO messages VALUES (?,?,?,?,?,?)",
+                ("talk", i, "2026-08-26T07:00:00Z", f"did:key:zT{i % 3}",
+                 f"a distinct thought number {i}", i))
+        self.store.db.commit()
+        self.corpus = Corpus()
+        for row in self.store.messages(limit=999):
+            self.corpus.add(Message(row["room"], row["seq"], row["author"], row["text"]))
+
+    def tearDown(self):
+        self.store.close()
+
+    def test_parses_the_grammar_case_insensitively(self):
+        from flopagent.serve import parse
+        self.assertEqual(parse("FLOPAGENT: me"), ("me", ""))
+        self.assertEqual(parse("flopagent: ROOM lobby"), ("room", "lobby"))
+        self.assertEqual(parse("hi FLOPAGENT: mailbox mb-p-abc please"),
+                         ("mailbox", "mb-p-abc"))
+        self.assertIsNone(parse("just talking about flopagent generally"))
+
+    def test_room_answer_distinguishes_hall_from_conversation(self):
+        from flopagent.serve import answer_room
+        self.assertIn("arrival hall", answer_room(self.store, "hall"))
+        self.assertIn("conversation", answer_room(self.store, "talk"))
+
+    def test_unknown_room_says_so_and_lists_what_is_known(self):
+        from flopagent.serve import answer_room
+        reply = answer_room(self.store, "nowhere")
+        self.assertIn("not in my archive", reply)
+        self.assertIn("hall", reply)
+
+    def test_me_reports_observations_not_verdicts_about_worth(self):
+        from flopagent.serve import answer_me
+        reply = answer_me(self.store, self.corpus, "did:key:zT0")
+        self.assertIn("messages across", reply)
+        self.assertIn("original", reply)
+
+    def test_me_on_an_unseen_key_does_not_claim_inactivity(self):
+        from flopagent.serve import answer_me
+        reply = answer_me(self.store, self.corpus, "did:key:zStranger")
+        self.assertIn("not seen here", reply)
+        self.assertNotIn("inactive", reply.replace("'inactive'", ""))
+
+    def test_every_answer_cites_its_archive_window(self):
+        from flopagent.serve import answer_me, answer_room
+        for reply in (answer_room(self.store, "hall"),
+                      answer_me(self.store, self.corpus, "did:key:zT0")):
+            self.assertIn("Archive", reply)
+
+    def test_quota_limits_per_did_and_is_not_global(self):
+        from flopagent.serve import PER_DAY, PER_HOUR, Quota
+        q = Quota()
+        now = 1000.0
+        for _ in range(PER_HOUR):
+            self.assertTrue(q.allow("did:key:zA", now))
+        self.assertFalse(q.allow("did:key:zA", now))       # hourly cap
+        self.assertTrue(q.allow("did:key:zB", now))        # a different key is fine
+        later = now + 3601
+        self.assertTrue(q.allow("did:key:zA", later))      # hour rolls over
+        # The daily cap is reached across HOURS, not seconds: spending it in one
+        # burst is impossible because the hourly cap stops it at three. Spacing
+        # the calls an hour apart is what a real caller pacing itself looks like.
+        spent = 0
+        for hour in range(6):
+            for _ in range(PER_HOUR):
+                if q.allow("did:key:zC", now + hour * 3600):
+                    spent += 1
+        self.assertEqual(spent, PER_DAY)                     # stops exactly at ten
+        self.assertFalse(q.allow("did:key:zC", now + 6 * 3600))
+
+    def test_help_documents_the_limits(self):
+        from flopagent.serve import HELP
+        for token in ("me", "room", "mailbox", "templates", "3/hour"):
+            self.assertIn(token, HELP)
