@@ -1558,3 +1558,52 @@ class TestCapacityMonitor(unittest.TestCase):
         self.assertGreater(entry["shards_shrank"], 0)
         self.assertIn("reap visible", entry["what"])
         self.assertIn("not growing", entry["what"])
+
+
+class TestTrustBoundary(unittest.TestCase):
+    """An archive should be able to say which of its own contents can be relied on."""
+
+    def setUp(self):
+        import tempfile
+        from flopagent.archive import Archive
+        self.store = Archive(pathlib.Path(tempfile.mkdtemp()) / "a.db")
+
+    def tearDown(self):
+        self.store.close()
+
+    def _hour(self, hour, kept, lost):
+        import calendar, time
+        for i in range(kept):
+            self.store.db.execute("INSERT INTO messages VALUES (?,?,?,?,?,?)",
+                                  ("r", hour * 1000 + i, f"2026-08-26T{hour:02d}:00:00Z",
+                                   "did:key:zA", "text", i))
+        if lost:
+            stamp = calendar.timegm(time.strptime(
+                f"2026-08-26 {hour:02d}:30:00", "%Y-%m-%d %H:%M:%S"))
+            self.store.db.execute("INSERT INTO gaps VALUES (?,?,?,?)",
+                                  ("r", hour * 100, hour * 100 + lost + 1, stamp))
+        self.store.db.commit()
+
+    def test_finds_the_hour_after_which_loss_stays_low(self):
+        self._hour(5, kept=100, lost=300)     # 75% loss
+        self._hour(6, kept=100, lost=40)      # 29%
+        self._hour(7, kept=100, lost=5)       # 5%
+        self._hour(8, kept=100, lost=5)       # 5%
+        self.assertEqual(self.store.trustworthy_from(), "2026-08-26T07")
+
+    def test_a_late_bad_hour_moves_the_boundary_forward(self):
+        # The boundary is the last contiguous clean run, not the first clean hour:
+        # a clean stretch followed by a bad hour is not a stretch you can rely on.
+        self._hour(5, kept=100, lost=1)
+        self._hour(6, kept=100, lost=500)     # regression
+        self._hour(7, kept=100, lost=1)
+        self.assertEqual(self.store.trustworthy_from(), "2026-08-26T07")
+
+    def test_no_clean_stretch_says_so_rather_than_guessing(self):
+        self._hour(5, kept=10, lost=900)
+        self.assertIsNone(self.store.trustworthy_from())
+
+    def test_loss_by_hour_reports_both_sides(self):
+        self._hour(7, kept=90, lost=10)
+        row = next(r for r in self.store.loss_by_hour() if r["hour"].endswith("07"))
+        self.assertEqual((row["kept"], row["lost"], row["loss_pct"]), (90, 10, 10))

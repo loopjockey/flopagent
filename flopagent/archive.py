@@ -249,6 +249,48 @@ class Archive:
             "GROUP BY author ORDER BY n DESC LIMIT ?", (limit,)
         ).fetchall()
 
+    def loss_by_hour(self) -> list[dict]:
+        """Kept, lost and loss share per hour. The archive's own quality record."""
+        import time as _t
+
+        lost: dict[str, int] = {}
+        for gap in self.db.execute(
+            "SELECT before_seq - after_seq - 1 AS lost, noticed_at FROM gaps"
+        ):
+            hour = _t.strftime("%Y-%m-%dT%H", _t.gmtime(gap["noticed_at"]))
+            lost[hour] = lost.get(hour, 0) + gap["lost"]
+        kept: dict[str, int] = {}
+        for row in self.db.execute("SELECT substr(ts,1,13) h, COUNT(*) n FROM messages "
+                                   "GROUP BY h"):
+            kept[row["h"]] = row["n"]
+        out = []
+        for hour in sorted(set(kept) | set(lost)):
+            k, l = kept.get(hour, 0), lost.get(hour, 0)
+            out.append({"hour": hour, "kept": k, "lost": l,
+                        "loss_pct": round(100 * l / max(k + l, 1))})
+        return out
+
+    def trustworthy_from(self, max_loss_pct: int = 10) -> str | None:
+        """Earliest hour after which every hour stayed under ``max_loss_pct``.
+
+        An archive should be able to say which of its own contents can be relied
+        on. This one has a dated quality boundary: loss ran at 76% during one hour
+        while per-room pacing was being built and restarts were frequent, and 7%
+        after it settled. A share computed across the whole corpus is dominated by
+        the bad hours (FINDINGS 19), so an analysis should either start here or
+        state the loss it is carrying.
+
+        Returns ``None`` when no such boundary exists — which is the honest answer
+        for an archive that has never had a clean stretch, not an error.
+        """
+        rows = self.loss_by_hour()
+        boundary = None
+        for row in reversed(rows):
+            if row["loss_pct"] > max_loss_pct:
+                break
+            boundary = row["hour"]
+        return boundary
+
     def room_profile(self) -> list[dict]:
         """Per-room shape: volume, distinct keys, template share, messages/key.
 

@@ -128,6 +128,9 @@ def main(argv: list[str] | None = None) -> int:
     st.add_argument("--db", default=None)
     st.add_argument("--gaps", action="store_true", help="list known holes")
     st.add_argument("--authors", action="store_true", help="most prolific keys")
+    st.add_argument("--trust", action="store_true",
+                    help="per-hour loss, and the point after which this archive's "
+                         "own data can be relied on")
     st.add_argument("--rooms", action="store_true",
                     help="per-room shape: template share and messages/key, the "
                          "cheapest discriminator between a real room and a farmed one")
@@ -254,6 +257,16 @@ def _dispatch(args) -> int:
                     for g in store.gaps()[:20]:
                         print(f"  /r/{g['room']}  {g['lost']} lost between "
                               f"{g['after_seq']} and {g['before_seq']}")
+                if args.trust:
+                    rows = store.loss_by_hour()
+                    print(f"  {'hour (UTC)':16}{'kept':>10}{'lost':>10}{'loss%':>8}")
+                    for r in rows[-14:]:
+                        print(f"  {r['hour']:16}{r['kept']:>10,}{r['lost']:>10,}"
+                              f"{r['loss_pct']:>7}%")
+                    boundary = store.trustworthy_from()
+                    print()
+                    print(f"  reliable from: {boundary or 'no clean stretch yet'}"
+                          "  (<=10% loss per hour thereafter)")
                 if args.rooms:
                     print(f"  {'room':20}{'msgs':>8}{'keys':>8}{'tmpl%':>7}"
                           f"{'msgs/key':>10}{'loss%':>7}")

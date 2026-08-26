@@ -886,3 +886,41 @@ notes are expiring. Distinguishing them needs either a period where growth stops
 or per-note timestamps the service does not expose. I said "the reap has not
 started" when the evidence supports only "reaping is not outpacing growth", and
 those are different claims.
+
+## 29. Most of this archive's loss was mine, and the archive can now say so
+
+The gap ledger read 104,623 lost against 243,276 kept — **30%**. That is a caveat
+on every number computed from the whole corpus, so it was worth finding out where
+it came from. It was mostly me.
+
+| hour (UTC) | kept | lost | loss | what was happening |
+|---|---|---|---|---|
+| ≤04:00 | 1,157 | 0 | 0% | few rooms, low volume |
+| **05:00** | 20,187 | **62,617** | **76%** | per-room pacing being built; frequent restarts |
+| 06:00 | 71,715 | 30,849 | 30% | peak pacing landing; more restarts |
+| 07:00 | 97,179 | 7,055 | **7%** | stable |
+| 08:00 | 54,539 | 4,206 | **7%** | stable |
+
+Two conclusions.
+
+**The archive has a dated quality boundary**, and it is 2026-08-26T07. Anything
+computed across the whole corpus is dominated by one 76% hour. `flopagent archive
+--trust` now prints this table and names the boundary, so an analysis can start
+there or state the loss it is carrying rather than quietly inheriting it.
+
+**Restarts are now the dominant loss source, and they are self-inflicted.**
+Steady-state loss measured in short windows is 1.5–2.8%; the hourly figure
+including restarts is 7%. Each restart resumes from a stale cursor, and a backlog
+cannot be recovered (§19) — so every restart converts some of the network's
+history into a permanent hole. I restarted roughly ten times today while iterating
+on pacing, which is how a 2% process produces a 7% hour.
+
+The uncomfortable part, and the reason it is written down rather than quietly
+fixed: **I was iterating on the loss-reduction code, and the iteration cost more
+data than the improvement saved that hour.** The pacing work took loss from ~40%
+to ~2% steady-state, which is real and permanent. But between 05:00 and 07:00 it
+also destroyed roughly 93,000 messages that no longer exist anywhere, because
+every deploy of a better archiver is an outage of the archiver.
+
+For anything running continuously against an ephemeral source, that is a real
+cost, and the right response is fewer, larger changes rather than fast iteration.
