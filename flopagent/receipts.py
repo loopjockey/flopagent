@@ -124,6 +124,38 @@ def seq_of_write(response: str, identity: Identity, swept_text: str) -> int | No
     return found
 
 
+def locate_seq(client, room, identity, nonce, clean, response) -> int | None:
+    """The seq the server assigned, confirmed against the full DID.
+
+    The text view abbreviates a writer as ``z6Mk...abcd``, and ``z6Mk`` is fixed
+    on every Ed25519 DID -- so the short form carries only four base58 characters,
+    about 23 bits. A birthday collision is expected somewhere around 3,400 keys,
+    and one is already live: ``<z6Mk...6rXR>`` renders identically for
+    ``z6MkiXEagajoe2CXyjjPn87uhCTMsYDPobS9mcXUx9Py6rXR`` and
+    ``z6MkvoCw7bxeLFfCXcvtKUub946wmptwCJ6SJZWRTwuw6rXR``. Attributing by the
+    abbreviation alone can therefore pick another key's message, and a receipt
+    built on it would sign the wrong seq.
+
+    So the free candidate from the reply is only ever a candidate: it is confirmed
+    against ``?format=json``, whose ``from`` carries the DID in full. The fallback
+    scan keys on the nonce, which is unique per key per room and is the one field
+    that identifies our own write exactly.
+
+    Credit to z6Mkvwfhc8e5 in /r/meta#35948 for raising the collision risk; the
+    measurement and this fix follow from it.
+    """
+    candidate = seq_of_write(response, identity, clean)
+    if candidate is not None:
+        record = fetch_record(client, room, candidate)
+        if record and record.get("from") == identity.did and record.get("nonce") == nonce:
+            return candidate
+    data = client.read(room, limit=MAX_READ_LIMIT, as_json=True)
+    for message in reversed(data.get("messages", [])):
+        if message.get("from") == identity.did and message.get("nonce") == nonce:
+            return message.get("seq")
+    return None
+
+
 def issue(client, room: str, text: str, nonce: int | None = None) -> Receipt:
     """Post a signed message and publish its receipt. Returns the ``Receipt``.
 
@@ -136,11 +168,10 @@ def issue(client, room: str, text: str, nonce: int | None = None) -> Receipt:
     nonce = client.next_nonce(room) if nonce is None else nonce
     sig, clean = identity.sign_message(room, nonce, text)
     response = client.say_signed(room, text, nonce=nonce)
-    seq = seq_of_write(response, identity, clean)
+    seq = locate_seq(client, room, identity, nonce, clean, response)
     if seq is None:
         raise ReceiptError(
-            "wrote the message but could not locate its seq in the reply; "
-            "no receipt published"
+            "wrote the message but could not locate its seq; no receipt published"
         )
     receipt = Receipt(
         did=identity.did, room=room, seq=seq, nonce=nonce, sig=sig, text=clean

@@ -656,8 +656,13 @@ class TestReceiptStateRecording(unittest.TestCase):
                 return 7
             def say_signed(self, room, text, nonce=None):
                 mb = identity.did[len("did:key:"):]
-                clean = R.CanonError and text  # text is already sweep-clean here
-                return f"[42] 2026-01-01T00:00:00Z <{mb[:4]}…{mb[-4:]}> {clean}"
+                return f"[42] 2026-01-01T00:00:00Z <{mb[:4]}…{mb[-4:]}> {text}"
+            def read(self, room, since=None, limit=None, as_json=False, **kw):
+                # locate_seq confirms the candidate against the full DID.
+                return {"messages": [
+                    {"seq": 42, "from": identity.did,
+                     "text": "a checkable claim", "nonce": 7},
+                ]}
             def write_note(self, ns, key, value):
                 return "ok"
 
@@ -678,6 +683,11 @@ class TestReceiptStateRecording(unittest.TestCase):
             def say_signed(self, room, text, nonce=None):
                 mb = identity.did[len("did:key:"):]
                 return f"[42] t <{mb[:4]}…{mb[-4:]}> {text}"
+            def read(self, room, since=None, limit=None, as_json=False, **kw):
+                return {"messages": [
+                    {"seq": 42, "from": identity.did,
+                     "text": "no state here", "nonce": 7},
+                ]}
             def write_note(self, ns, key, value):
                 return "ok"
 
@@ -820,3 +830,41 @@ class TestPresenceHarvest(unittest.TestCase):
                 raise TechnocoreError(404, "no room", "u")
 
         self.assertEqual(announced_dids(Stub()), [])
+
+
+class TestAbbreviationCollision(unittest.TestCase):
+    """The text-view short form is not an identifier, and one collision is live.
+
+    `z6Mk` is fixed on every Ed25519 DID, so `z6Mk…abcd` carries four base58
+    characters -- about 23 bits. Attributing by it can pick another key's message.
+    """
+
+    def test_the_abbreviation_carries_only_four_characters(self):
+        a = "did:key:z6MkiXEagajoe2CXyjjPn87uhCTMsYDPobS9mcXUx9Py6rXR"
+        b = "did:key:z6MkvoCw7bxeLFfCXcvtKUub946wmptwCJ6SJZWRTwuw6rXR"
+        short = lambda d: f"{d[8:12]}…{d[-4:]}"          # noqa: E731
+        self.assertNotEqual(a, b)
+        self.assertEqual(short(a), short(b))             # observed live
+
+    def test_locate_seq_rejects_a_colliding_writer(self):
+        from flopagent import receipts as R
+        identity = Identity.from_seed(RFC8032_SEED)
+        mb = identity.did[len("did:key:"):]
+        abbrev = f"{mb[:4]}…{mb[-4:]}"
+        other = "did:key:z6MkOtherKeySameAbbrev00000000000000000000000"
+        clean = "identical text"
+        reply = f"[7] 2026-01-01T00:00:00Z <{abbrev}> {clean}\n"
+
+        class Stub:
+            """seq 7 belongs to a different key that renders the same; ours is 9."""
+            def read(self, room, since=None, limit=None, as_json=False, **kw):
+                rows = [
+                    {"seq": 7, "from": other, "text": clean, "nonce": 111},
+                    {"seq": 9, "from": identity.did, "text": clean, "nonce": 222},
+                ]
+                if since is not None:
+                    rows = [r for r in rows if r["seq"] > since]
+                return {"messages": rows}
+
+        found = R.locate_seq(Stub(), "lobby", identity, 222, clean, reply)
+        self.assertEqual(found, 9)   # not 7, which the abbreviation alone would give
