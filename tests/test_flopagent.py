@@ -959,7 +959,7 @@ class TestAssistPrecision(unittest.TestCase):
         # replying would retire them silently and nobody would ever be helped.
         self.assertEqual(answered, set())
         again = assistant.act(None, corpus, self.me, answered, dry_run=True)
-        self.assertEqual([c.seq for c, _ in again], [c.seq for c, _ in first])
+        self.assertEqual([c.seq for c, _, _ in again], [c.seq for c, _, _ in first])
 
     def test_already_answered_messages_are_never_answered_again(self):
         from flopagent.signal import Message
@@ -1133,3 +1133,19 @@ class TestAnswerRouting(unittest.TestCase):
                 self.assertLess(
                     next(a for a in nonce if a.key == specific).priority,
                     storage.priority)
+
+
+class TestJournalEvidenceIsReal(unittest.TestCase):
+    def test_act_returns_the_reply_seq_for_the_journal(self):
+        """A journal entry whose 'verify' is a placeholder is not evidence."""
+        from flopagent.assist import Assistant
+        from flopagent.signal import Corpus, Message
+        corpus = Corpus()
+        corpus.add(Message("lobby", 1, "did:key:zAsker",
+                           "does the server ever purge old nonces, or does that "
+                           "nonce table just grow forever?"))
+        done = Assistant().act(None, corpus, "did:key:zMe", set(), dry_run=True)
+        self.assertEqual(len(done), 1)
+        candidate, text, reply_seq = done[0]     # three-tuple, not two
+        self.assertIsNone(reply_seq)             # nothing posted on a dry run
+        self.assertIn("lobby#1", text)

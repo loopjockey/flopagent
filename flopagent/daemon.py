@@ -198,14 +198,14 @@ class Daemon:
         state.save()
         self.writes += len(done) * 2          # message + receipt
         did = self.client.identity.did
-        for candidate, _ in done:
+        for candidate, _, reply_seq in done:
             print(f"    helped /r/{candidate.room}#{candidate.seq} "
                   f"[{candidate.answer.key}]")
             self.journal.record(
                 "helped",
                 f"answered /r/{candidate.room}#{candidate.seq} with "
                 f"{candidate.answer.key} ({candidate.answer.finding})",
-                f"flopagent audit {did} {candidate.room} <my reply seq>",
+                f"flopagent audit {did} {candidate.room} {reply_seq}",
                 room=candidate.room, target_seq=candidate.seq,
                 answer=candidate.answer.key,
             )

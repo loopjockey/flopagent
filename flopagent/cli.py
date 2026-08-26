@@ -316,7 +316,7 @@ def _dispatch(args) -> int:
         if not done:
             print("nothing answerable right now (silence is the common case)")
             return 0
-        for candidate, text in done:
+        for candidate, text, _ in done:
             print(f"{'WOULD REPLY' if args.dry_run else 'REPLIED'} "
                   f"/r/{candidate.room}#{candidate.seq} [{candidate.answer.key}]")
             print(f"  {text[:300]}")

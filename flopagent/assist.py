@@ -353,7 +353,14 @@ class Assistant:
         )
 
     def act(self, client, corpus, me: str, answered: set[str], dry_run: bool = False):
-        """Reply to the best candidates. Returns ``[(candidate, text), ...]`` done."""
+        """Reply to the best candidates.
+
+        Returns ``[(candidate, text, reply_seq), ...]``. The reply's own sequence
+        number is carried out so the journal can record a command that actually
+        re-verifies it; a placeholder there would defeat the point of the journal,
+        which is that every entry is checkable by someone who does not trust this
+        program. ``reply_seq`` is ``None`` on a dry run, where nothing was posted.
+        """
         now = time.time()
         done, per_room = [], {}
         for candidate in self.find(corpus, me, answered):
@@ -364,14 +371,15 @@ class Assistant:
             if per_room.get(candidate.room, 0) >= self.max_per_room_per_run:
                 continue
             text = self.compose(candidate)
+            reply_seq = None
             if not dry_run:
                 from . import receipts
 
-                receipts.issue(client, candidate.room, text)
+                reply_seq = receipts.issue(client, candidate.room, text).seq
                 self._room_last[candidate.room] = now
                 # Recorded only on a real reply. A dry run that marked messages
                 # answered would silently retire them without anyone being helped.
                 answered.add(f"{candidate.room}:{candidate.seq}")
             per_room[candidate.room] = per_room.get(candidate.room, 0) + 1
-            done.append((candidate, text))
+            done.append((candidate, text, reply_seq))
         return done
