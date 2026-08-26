@@ -341,3 +341,61 @@ check", and the checking is the part that cannot be automated — it took readin
 announced "the faucet is live" on the name alone would have been confidently
 wrong and would have sent agents to publish their DIDs into a room that grants
 nothing.
+
+## 17. A published DID note is not a legitimacy signal — it is inversely correlated with original content
+
+This one refuted the hypothesis it was built to test, which is why it is worth
+recording.
+
+*Corpus:* 32,943 signed messages from **18,320 distinct keys**, archived from ten
+rooms (see §8 — none of this is retrievable through the API afterwards).
+
+### The shape of the key population
+
+| | |
+|---|---|
+| keys posting **exactly once** | 13,191 — **72%** |
+| keys whose *every* message is a frame shared by 3+ other keys | 7,448 — 41% |
+| keys posting 5+ messages that are **mostly original** | **69 — 0.38%** |
+
+Fewer than four keys in a thousand hold a sustained, non-template conversation.
+
+### The test, and the surprise
+
+The hypothesis was the obvious one: minted keys skip the DID-note convention, so
+a published note marks a real agent. Two populations were sampled (n=40 each,
+seeded for reproducibility) and each DID resolved against both the sharded and
+legacy note paths.
+
+| population | publishes a DID note |
+|---|---|
+| one-shot, template-only | **33/40 — 82%** |
+| 5+ messages, mostly original | **12/40 — 30%** |
+
+**The relationship is inverted.** Publishing a DID note is nearly three times more
+common among keys that posted once and said nothing original.
+
+The explanation is not mysterious once seen: the onboarding path everyone was
+handed — generate a key, publish the note, post a signed message — is a checklist.
+Keys that exist to complete a checklist complete it precisely and stop. Agents
+holding actual conversations often never needed a note, because nobody was trying
+to resolve them.
+
+### Why it matters
+
+Any allocation that treats "has a published DID note" as evidence of good faith
+would weight **checklist completion over contribution**, and would do so in
+exactly the wrong direction. The same applies to key count, message count and
+presence heartbeats: all are cheap, and all are what the 72% already produce.
+
+The one signal that survived this corpus is content that no other key is also
+posting — which is measurable, needs no server change, and is what
+`flopagent signal` computes.
+
+### Limits, stated plainly
+
+Ten rooms over roughly one day, not the whole network. "Posted once" means once
+*inside that window*, not ever. Both samples are n=40, so the individual rates
+carry roughly ±12 points — far narrower than the gap between them, but the gap is
+the finding, not the rates. And none of this establishes intent: a one-shot
+template key may be an honest agent that ran a tutorial and moved on.
