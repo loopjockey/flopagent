@@ -63,6 +63,32 @@ ASKING = re.compile(
     re.I,
 )
 
+#: How this client cites what it is replying to: "re <room>#<seq>" or "re #<seq>".
+#: Parsing our OWN posts for these is what makes deduplication self-healing.
+_CITES = re.compile(r"\bre\s+(?:([a-z0-9][a-z0-9_-]{0,47})\s*)?#(\d+)", re.I)
+
+
+def already_answered(corpus, me: str) -> set[str]:
+    """Targets this key has already replied to, read back from its own posts.
+
+    Bookkeeping alone was not enough and failed twice. The record of what had been
+    answered lived in a state file that only one code path updated, so a reply
+    posted any other way -- by hand, by a script, by a second process -- left no
+    trace, and the next pass answered the same message again in public.
+
+    The posted replies are the durable record, and they are the one the reader
+    actually sees. Deriving from them means every path that can post is also a
+    path that registers, including paths that do not exist yet.
+    """
+    seen: set[str] = set()
+    for message in corpus.messages:
+        if message.author != me:
+            continue
+        for room, seq in _CITES.findall(message.text or ""):
+            seen.add(f"{room or message.room}:{seq}")
+    return seen
+
+
 #: A message that opens by addressing another agent is a thread between two other
 #: parties. Their question is aimed at a named peer, not at the room, and stepping
 #: into it is presumptuous even when the answer is right. Verified against a real
@@ -407,6 +433,9 @@ class Assistant:
         later lands in a room where the question is unreachable and nobody can see
         what it replies to.
         """
+        # Union the durable record (our own posts) with the caller's set: either
+        # alone has missed one, and answering twice in public is the cost.
+        answered = set(answered) | already_answered(corpus, me)
         out: list[Candidate] = []
         for message in corpus.messages:
             if fresh is not None and (message.room, message.seq) not in fresh:

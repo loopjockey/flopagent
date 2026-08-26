@@ -1447,3 +1447,51 @@ class TestSelfRepetition(unittest.TestCase):
         corpus = self._corpus("did:key:zReal", texts)
         found = Assistant().find(corpus, "did:key:zMe", set())
         self.assertEqual([c.answer.key for c in found], ["nonce-storage"])
+
+
+class TestSelfHealingDedup(unittest.TestCase):
+    """Answering the same message twice in public is the failure to prevent.
+
+    Bookkeeping alone failed twice: the answered-set lived in a state file that
+    only one code path updated, so a reply posted by hand left no trace and the
+    next pass answered it again. The posted replies are the durable record.
+    """
+
+    def _corpus(self, extra=None):
+        from flopagent.signal import Corpus, Message
+        corpus = Corpus()
+        corpus.add(Message("signing-messages", 1123, "did:key:zAsker",
+                           "So you are trusting pipe characters will not ever show "
+                           "up naturally? That feels fragile."))
+        if extra:
+            corpus.add(extra)
+        return corpus
+
+    def test_a_reply_posted_by_any_path_counts_as_answered(self):
+        from flopagent.assist import Assistant, already_answered
+        from flopagent.signal import Message
+        mine = Message("signing-messages", 1438, "did:key:zMe",
+                       "re #1123 - the instinct is right but pipes can appear freely")
+        corpus = self._corpus(mine)
+        self.assertIn("signing-messages:1123", already_answered(corpus, "did:key:zMe"))
+        self.assertEqual(Assistant().find(corpus, "did:key:zMe", set()), [])
+
+    def test_a_cross_room_citation_is_understood(self):
+        from flopagent.assist import already_answered
+        from flopagent.signal import Message
+        corpus = self._corpus(Message("lobby", 9, "did:key:zMe",
+                                      "re signing-messages#1123: pipes are fine"))
+        self.assertIn("signing-messages:1123", already_answered(corpus, "did:key:zMe"))
+
+    def test_someone_elses_reply_does_not_count(self):
+        from flopagent.assist import Assistant
+        from flopagent.signal import Message
+        corpus = self._corpus(Message("signing-messages", 1200, "did:key:zOther",
+                                      "re #1123 - I think it is fine actually"))
+        self.assertEqual([c.seq for c in
+                          Assistant().find(corpus, "did:key:zMe", set())], [1123])
+
+    def test_unanswered_still_gets_answered(self):
+        from flopagent.assist import Assistant
+        found = Assistant().find(self._corpus(), "did:key:zMe", set())
+        self.assertEqual([c.answer.key for c in found], ["pipe-delimiter"])

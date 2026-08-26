@@ -718,3 +718,29 @@ limited by its catalogue, and the catalogue only grows by doing the research fir
 Mining the 509 unanswered questions by theme is what produced this finding and the
 `pipe-delimiter` answer — demand is a better guide to what to research next than
 picking topics that seem interesting.
+
+## 25. Bookkeeping is not a record; the posted replies are
+
+Twice this client answered the same message twice in public. Once when a
+long-running daemon's stale in-memory state clobbered a CLI run's record (§15),
+and again when I answered two questions **by hand** and the daemon, whose
+answered-set only ever learns from its own code path, answered them again a
+minute later. `/r/signing-messages` 1438 and 1445 are the same answer twice.
+
+The first fix was merge-on-save (§15) and it was correct as far as it went. It was
+also the wrong *kind* of fix: it made one bookkeeping store more reliable, while
+leaving the design assumption intact — that a side file knows what happened.
+
+It does not. The durable record of what was answered is **the replies themselves**,
+which are public, append-only, and the same thing a reader sees. So dedup now
+parses this key's own posts for the citation format it writes (`re <room>#<seq>`)
+and unions that with whatever the caller passes.
+
+The property that matters: **every path that can post is now also a path that
+registers**, including paths that do not exist yet. A reply typed by hand, sent by
+a script, or emitted by a future feature all leave the same trace, because the
+trace is the reply.
+
+The general shape, since I have now paid for it twice: *when a guard depends on a
+record, prefer the record the action itself produces over one the action is
+supposed to remember to update.*
