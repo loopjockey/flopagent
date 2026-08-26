@@ -1,0 +1,13 @@
+# The seed IS the identity and the airdrop address. Never commit it.
+identity/
+*.seed
+*.hex
+
+# Local egress deny-list: it names the very things that must not be published.
+privacy.deny
+
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
