@@ -39,12 +39,13 @@ from .client import Client, TechnocoreError
 from .health import REFRESH_THRESHOLD_SECONDS
 from .identity import note_path
 from .journal import Journal
+from .pacing import Pacer
 
-#: How often each job runs, in seconds. Indexing is frequent because the read
-#: window is only 200 deep and falling behind loses data permanently: /r/lobby
-#: sustains roughly 50 messages/second, so a 45s period was dropping ~700 per
-#: cycle and saying so. Everything else is slow on purpose.
-INDEX_EVERY = 20
+#: How often each job runs, in seconds. `index` ticks fast but polls only the
+#: rooms the pacer says are due, so the tick rate is a floor on responsiveness
+#: rather than a per-room cost: a 9/s room gets a short period and a room seeing
+#: two messages in twenty minutes gets a long one. Everything else is slow.
+INDEX_EVERY = 5
 HEARTBEAT_EVERY = 300
 BROADCAST_EVERY = 3 * 3600
 FAUCET_EVERY = 900
@@ -84,6 +85,10 @@ class Daemon:
     _assistant: object = None
     #: ``(room, seq)`` of everything the last index pass brought in.
     _fresh: set = field(default_factory=set)
+    #: Per-room cadence. One interval cannot serve a 9/s room and a 2-per-20min
+    #: room at once, and under-polling the fast one destroys history rather than
+    #: delaying it.
+    pacer: Pacer = field(default_factory=Pacer)
 
     def __post_init__(self) -> None:
         check_name(self.nick, "nick")
@@ -111,16 +116,21 @@ class Daemon:
     # ---- jobs ------------------------------------------------------------
 
     def do_index(self) -> str:
+        due = self.pacer.due(self.rooms)
+        if not due:
+            self._fresh = set()
+            return "none due"
         stored = missed = 0
-        before = {r: self.archive.cursor_for(r) or 0 for r in self.rooms}
-        for result in self.archive.sweep(self.client, self.rooms):
+        before = {r: self.archive.cursor_for(r) or 0 for r in due}
+        for result in self.archive.sweep(self.client, due):
             stored += result.stored
             missed += result.missed
+            self.pacer.observed(result.room, result.stored, result.missed)
         # Remember exactly what is new, so assist can answer it while it is still
         # inside the window a reader can address.
         self._fresh = {
             (r, row["seq"])
-            for r in self.rooms
+            for r in due
             for row in self.archive.db.execute(
                 "SELECT seq FROM messages WHERE room = ? AND seq > ?", (r, before[r])
             ).fetchall()
@@ -135,10 +145,10 @@ class Daemon:
                 "flopagent archive",
                 stored=stored, missed=missed,
             )
-        note = f"+{stored}"
+        note = f"+{stored} from {len(due)}/{len(self.rooms)} rooms"
         if missed:
-            note += f" ({missed} lost -- polling slower than the room)"
-        return note
+            note += f", {missed} LOST"
+        return f"{note}  [{self.pacer.summary()}]"
 
     def do_heartbeat(self) -> str:
         """The presence convention from the manual, verbatim.

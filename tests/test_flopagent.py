@@ -1200,3 +1200,116 @@ class TestAssistFreshness(unittest.TestCase):
             corpus.add(Message("lobby", i, f"did:key:zK{i}", line))
         found = Assistant().find(corpus, "did:key:zMe", set(), fresh={("lobby", 3)})
         self.assertEqual(found, [])
+
+
+class TestPacing(unittest.TestCase):
+    """One interval cannot serve a 9/s room and a 2-per-20-min room.
+
+    Under-polling a fast room does not delay data, it destroys it: once 200 land
+    between polls the older ones leave the only addressable window permanently,
+    while still existing on the server.
+    """
+
+    def setUp(self):
+        from flopagent.pacing import Pacer
+        self.pacer = Pacer()
+
+    def test_a_fast_room_gets_a_short_period(self):
+        from flopagent.pacing import MIN_PERIOD, TARGET_PER_POLL
+        # 9 messages/second, the measured rate of /r/lobby.
+        self.pacer.observed("lobby", arrived=0, missed=0, now=1000.0)
+        self.pacer.observed("lobby", arrived=90, missed=0, now=1010.0)
+        period = self.pacer.rooms["lobby"].period
+        self.assertGreaterEqual(period, MIN_PERIOD)
+        self.assertLess(period, TARGET_PER_POLL / 8 + 1)   # ~13s at 9/s
+
+    def test_a_quiet_room_is_left_alone(self):
+        from flopagent.pacing import MAX_PERIOD
+        self.pacer.observed("chat", arrived=0, missed=0, now=1000.0)
+        self.pacer.observed("chat", arrived=1, missed=0, now=1600.0)   # 1 per 10min
+        self.assertEqual(self.pacer.rooms["chat"].period, MAX_PERIOD)
+
+    def test_loss_shortens_the_period_immediately(self):
+        # Converging gently on a room that is already losing history is just a
+        # slower way to keep losing it.
+        self.pacer.observed("lobby", arrived=0, missed=0, now=1000.0)
+        self.pacer.observed("lobby", arrived=200, missed=0, now=1020.0)
+        calm = self.pacer.rooms["lobby"].period
+        self.pacer.observed("lobby", arrived=200, missed=300, now=1040.0)
+        self.assertLess(self.pacer.rooms["lobby"].period, calm)
+
+    def test_rate_counts_what_was_lost_too(self):
+        # Pacing on stored alone reads a saturated poll as "exactly 200 per
+        # period" and never speeds up -- the exact failure this prevents.
+        self.pacer.observed("lobby", arrived=0, missed=0, now=1000.0)
+        self.pacer.observed("lobby", arrived=200, missed=800, now=1010.0)
+        self.assertAlmostEqual(self.pacer.rooms["lobby"].rate, 100.0, delta=1.0)
+
+    def test_due_returns_busiest_first(self):
+        # On a sequential sweep, a slow room polled first is time the fast room
+        # spends filling up.
+        for room, n in (("chat", 1), ("lobby", 500), ("meta", 50)):
+            self.pacer.observed(room, 0, 0, now=1000.0)
+            self.pacer.observed(room, n, 0, now=1010.0)
+        due = self.pacer.due(["chat", "lobby", "meta"], now=1e9)
+        self.assertEqual(due, ["lobby", "meta", "chat"])
+
+    def test_a_room_not_yet_due_is_skipped(self):
+        self.pacer.observed("lobby", 0, 0, now=1000.0)
+        self.pacer.observed("lobby", 90, 0, now=1010.0)
+        self.assertEqual(self.pacer.due(["lobby"], now=1011.0), [])
+
+    def test_an_unseen_room_is_due_immediately(self):
+        self.assertEqual(self.pacer.due(["brand-new"], now=1000.0), ["brand-new"])
+
+
+class TestPacingStartup(unittest.TestCase):
+    def test_an_unmeasured_room_is_polled_again_soon(self):
+        """A rate of zero before any elapsed window means unmeasured, not quiet.
+
+        Treating them the same backed every room off to MAX_PERIOD after its
+        first poll and stalled the archive completely.
+        """
+        from flopagent.pacing import MIN_PERIOD, Pacer
+        pacer = Pacer()
+        pacer.observed("lobby", arrived=200, missed=0, now=1000.0)
+        self.assertEqual(pacer.rooms["lobby"].period, MIN_PERIOD)
+        self.assertEqual(pacer.due(["lobby"], now=1000.0 + MIN_PERIOD), ["lobby"])
+
+    def test_a_measured_zero_really_does_back_off(self):
+        from flopagent.pacing import MAX_PERIOD, Pacer
+        pacer = Pacer()
+        pacer.observed("ghost", 0, 0, now=1000.0)
+        pacer.observed("ghost", 0, 0, now=1100.0)      # a real window, no traffic
+        self.assertEqual(pacer.rooms["ghost"].period, MAX_PERIOD)
+
+
+class TestPacingBursts(unittest.TestCase):
+    """Pacing on the mean guarantees loss on every burst.
+
+    /r/lobby swings between ~20 and ~50 messages a second. A period set for the
+    average is by definition too slow for the peak, and the peak is exactly when
+    the 200-message window overflows and history goes permanently.
+    """
+
+    def test_period_follows_the_peak_not_the_average(self):
+        from flopagent.pacing import Pacer
+        pacer = Pacer()
+        pacer.observed("lobby", 0, 0, now=0.0)
+        pacer.observed("lobby", 500, 0, now=10.0)      # burst: 50/s
+        for i in range(1, 5):                          # then quiet: 20/s
+            pacer.observed("lobby", 200, 0, now=10.0 + 10 * i)
+        pace = pacer.rooms["lobby"]
+        self.assertLess(pace.rate, 50.0)               # the mean has decayed
+        self.assertEqual(pace.pace_rate, 50.0)         # the schedule has not
+        self.assertLessEqual(pace.period, 120 / 50 + 0.01)
+
+    def test_the_peak_eventually_expires(self):
+        # A burst an hour ago should not pace the room forever.
+        from flopagent.pacing import PEAK_WINDOW, Pacer
+        pacer = Pacer()
+        pacer.observed("lobby", 0, 0, now=0.0)
+        pacer.observed("lobby", 500, 0, now=10.0)
+        for i in range(1, PEAK_WINDOW + 2):
+            pacer.observed("lobby", 10, 0, now=10.0 + 10 * i)
+        self.assertLess(pacer.rooms["lobby"].pace_rate, 50.0)

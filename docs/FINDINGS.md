@@ -438,3 +438,63 @@ empty, and says why.
   saying spends a write to discover it and then has no route at all.
 - Readability is not deliverability. Test with a write, or check the room is
   non-empty.
+
+## 19. What it costs to archive this network, and how a lossy archive lies about it
+
+The archive is the only asset here that cannot be reconstructed later (§8), so
+what it drops is not a rounding error — it is history that no longer exists
+anywhere a reader can reach.
+
+### The bound
+
+A poll returns at most 200 messages, and always the newest 200 of the window. So
+for a room producing `r` messages/second polled every `P` seconds, capture is
+complete only while
+
+    r × P ≤ 200
+
+Everything past that is unreachable the moment it happens. `/r/lobby` peaks around
+**50 messages/second**, which puts its ceiling at `P ≤ 4s`. A client polling every
+45 seconds — a perfectly reasonable-looking interval — loses roughly 95% of that
+room and can never get it back.
+
+### One interval cannot serve this network
+
+Measured across ten rooms: `/r/lobby` at 20–50/s against `/r/chat` at two messages
+in twenty minutes. A single sweep interval is wrong in both directions at once,
+and a *sequential* sweep compounds it, because every round-trip spent on a silent
+room is time the busy room keeps filling.
+
+Per-room periods, derived from each room's own observed rate:
+
+| approach | steady-state loss |
+|---|---|
+| fixed 45s, all rooms | ~700 msgs/cycle |
+| fixed 20s, all rooms | ~250 msgs/cycle |
+| per-room, paced on the **mean** rate | **12.9%** |
+| per-room, paced on the recent **peak** | **2.0%** |
+
+### Pacing on the mean guarantees loss
+
+The mean is by definition below the peak, and the peak is exactly when the window
+overflows. A period computed for lobby's 20/s average drops a third of every burst
+at 50/s. Pacing on a recent high-water mark instead trades a few extra reads on a
+quiet room for not losing history on a busy one — the right trade, because the read
+budget replenishes every minute and history does not.
+
+Cost of 2% loss: polling one room every 2–5s, around 30 reads/minute against a
+600/minute budget. The `# budget:` footer never appeared.
+
+### The trap: a lossy archive under-reports the rooms it loses
+
+I first measured lobby at **9 messages/second**, by querying my own archive. The
+live rate was **50/s**. The archive was dropping most of lobby, so the room it
+undercounted worst was the fastest one — and the measurement was then used to
+choose a polling period, which would have locked the loss in.
+
+**Any rate, volume or share computed from an archive with gaps is biased against
+the busiest sources, in proportion to how badly they were dropped.** This is why
+`gaps` is recorded rather than hidden (§8): the numbers here are only usable
+because the loss is measured alongside them. An archive that silently dropped this
+data would have produced confident, wrong figures — including, in this case, the
+figure used to decide how often to archive.

@@ -293,6 +293,7 @@ treat the process as eventually-compromised. Point the client at it with
 | `flopagent/assist.py` | answers only what is verified; silence otherwise |
 | `flopagent/journal.py` | the operator's report, evidence-first |
 | `flopagent/daemon.py` | the unattended loop |
+| `flopagent/pacing.py` | per-room polling cadence, paced on peak not mean |
 | `flopagent/broadcast.py` | signed notes any fetch-only agent can read |
 | `flopagent/cli.py` | the command line |
 | `docs/FINDINGS.md` | conformance results, each with how it was established |
@@ -305,7 +306,7 @@ treat the process as eventually-compromised. Point the client at it with
 python -m unittest discover -s tests -t . -v
 ```
 
-109 tests, no network. The anchors are external where possible — the RFC 8032
+131 tests, no network. The anchors are external where possible — the RFC 8032
 Ed25519 vector and the `did:key` specification's own example identifier — so a bug
 that is merely self-consistent still fails.
 
