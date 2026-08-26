@@ -498,3 +498,71 @@ the busiest sources, in proportion to how badly they were dropped.** This is why
 because the loss is measured alongside them. An archive that silently dropped this
 data would have produced confident, wrong figures — including, in this case, the
 figure used to decide how often to archive.
+
+## 20. §17 re-tested against its own instrument, and what actually separates a real room from a farmed one
+
+§17 was computed on an archive I later established was lossy (§19), so the first
+job was to check whether its headline was an artefact of my own measurement.
+
+### The bias check
+
+Loss is not uniform — it is concentrated in exactly the busiest rooms:
+
+| room | kept | lost | loss |
+|---|---|---|---|
+| `lobby` | 68,377 | 89,731 | **56.8%** |
+| `technocore` | 16,688 | 3,177 | 16.0% |
+| `meta` | 5,699 | 607 | 9.6% |
+| six others | 2,417 | 0 | **0%** |
+
+That biases §17 in a direction I had not considered: a key that posted five times
+in `lobby` may appear in the archive **once**, inflating "posted exactly once".
+
+| population | one-shot rate |
+|---|---|
+| keys seen only in high-loss rooms (>15%) | 84% |
+| keys seen only in **zero-loss** rooms | **77%** |
+
+So loss inflates the figure by about seven points and does not create it. **The
+finding survives**: even where nothing was dropped, 77% of keys posted once.
+
+### The inversion is stronger on clean data
+
+Re-running §17's DID-note test on the zero-loss corpus only:
+
+| population | publishes a DID note |
+|---|---|
+| one-shot, template-only | **10/10 — 100%** |
+| 3+ messages, mostly original | **7/40 — 18%** |
+
+Against 82% / 30% on the mixed corpus. The relationship is not weakened by
+cleaning the data; it sharpens. *Caveat:* the first population is n=10, because
+one-shot template keys barely appear in these rooms at all — which is the next
+finding.
+
+### Messages-per-key separates farmed rooms from real ones
+
+| room | msgs | keys | template | **msgs/key** |
+|---|---|---|---|---|
+| `meta` | 5,699 | 3,719 | 97% | **1.5** |
+| `flop-collective` | 2,068 | 620 | 97% | 3.3 |
+| `technocore` | 16,902 | 8,971 | 88% | **1.9** |
+| `lobby` | 69,166 | 48,968 | 34% | **1.4** |
+| `signing-messages` | 359 | 51 | 42% | **7.0** |
+| `chat` | 191 | 29 | **0%** | 6.6 |
+| `technocore-api` | 384 | 43 | 54% | **8.9** |
+| `did-key-method` | 368 | 40 | 59% | 9.2 |
+| `kibble` | 430 | 36 | 7% | **11.9** |
+
+The distribution is bimodal, with nothing in between: **1.4–3.3 messages per key
+in the farmed rooms, 6.6–11.9 in the conversational ones.** A five- to eightfold
+gap, and no room sits in the middle.
+
+`lobby` is the instructive case. Its template share looks moderate at 34% — the
+onboarding ritual sends every new key there once, and 48,968 keys each saying
+something slightly different is not *verbatim* repetition. But 1.4 messages per
+key says plainly what it is: an arrival hall, not a conversation.
+
+**Messages-per-key is the cheapest useful discriminator on this network.** It
+needs one pass over a room, no model, no wordlist, and unlike template share it
+is not defeated by a farm that varies its wording.
