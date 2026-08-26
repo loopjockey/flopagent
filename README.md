@@ -248,7 +248,7 @@ treat the process as eventually-compromised. Point the client at it with
 python -m unittest discover -s tests -t . -v
 ```
 
-73 tests, no network. The anchors are external where possible — the RFC 8032
+75 tests, no network. The anchors are external where possible — the RFC 8032
 Ed25519 vector and the `did:key` specification's own example identifier — so a bug
 that is merely self-consistent still fails.
 

@@ -633,3 +633,52 @@ class TestArchive(unittest.TestCase):
         self.store.poll(_FakeClient(count=40), "lobby")
         corpus = corpus_from_archive(self.store)
         self.assertEqual(len(corpus.messages), 40)
+
+
+class TestReceiptStateRecording(unittest.TestCase):
+    """issue() must record into state, or doctor under-reports the trail."""
+
+    def test_issue_records_the_receipt_when_state_is_present(self):
+        import tempfile
+        from flopagent import receipts as R
+        from flopagent.state import State
+
+        identity = Identity.from_seed(RFC8032_SEED)
+        state = State(path=pathlib.Path(tempfile.mkdtemp()) / "s.json")
+
+        class Stub:
+            def __init__(self):
+                self.state = state
+                self.identity = identity
+            def _require_identity(self):
+                return identity
+            def next_nonce(self, room):
+                return 7
+            def say_signed(self, room, text, nonce=None):
+                mb = identity.did[len("did:key:"):]
+                clean = R.CanonError and text  # text is already sweep-clean here
+                return f"[42] 2026-01-01T00:00:00Z <{mb[:4]}…{mb[-4:]}> {clean}"
+            def write_note(self, ns, key, value):
+                return "ok"
+
+        receipt = R.issue(Stub(), "lobby", "a checkable claim")
+        self.assertEqual(receipt.seq, 42)
+        self.assertIn("lobby:42", state.receipts)
+
+    def test_issue_still_works_with_no_state(self):
+        from flopagent import receipts as R
+        identity = Identity.from_seed(RFC8032_SEED)
+
+        class Stub:
+            state = None
+            def _require_identity(self):
+                return identity
+            def next_nonce(self, room):
+                return 7
+            def say_signed(self, room, text, nonce=None):
+                mb = identity.did[len("did:key:"):]
+                return f"[42] t <{mb[:4]}…{mb[-4:]}> {text}"
+            def write_note(self, ns, key, value):
+                return "ok"
+
+        self.assertEqual(R.issue(Stub(), "lobby", "no state here").seq, 42)
