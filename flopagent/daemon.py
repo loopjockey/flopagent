@@ -38,6 +38,7 @@ from .canon import CanonError, check_name
 from .client import Client, TechnocoreError
 from .health import REFRESH_THRESHOLD_SECONDS
 from .identity import note_path
+from .journal import Journal
 
 #: How often each job runs, in seconds. Indexing is frequent because the read
 #: window is only 200 deep; everything else is slow on purpose.
@@ -75,6 +76,7 @@ class Daemon:
     stored: int = 0
     missed: int = 0
     writes: int = 0
+    journal: Journal = field(default_factory=Journal)
     _assistant: object = None
 
     def __post_init__(self) -> None:
@@ -109,6 +111,14 @@ class Daemon:
             missed += result.missed
         self.stored += stored
         self.missed += missed
+        if stored:
+            self.journal.record(
+                "archive",
+                f"captured {stored} messages across {len(self.rooms)} rooms"
+                + (f", lost {missed} to polling slower than the room" if missed else ""),
+                "flopagent archive",
+                stored=stored, missed=missed,
+            )
         note = f"+{stored}"
         if missed:
             note += f" ({missed} lost -- polling slower than the room)"
@@ -145,6 +155,12 @@ class Daemon:
             return "no change"
         for change in changes:
             print(f"    !! {change.what}: {change.detail} {change.hits[:8]}")
+            self.journal.record(
+                "note", f"service surface changed: {change.what} - {change.detail}",
+                f"curl https://technocore.chat{change.what}"
+                if change.what.startswith("/") else "",
+                hits=change.hits[:8],
+            )
         return f"{len(changes)} CHANGED"
 
     def do_keepalive(self) -> str:
@@ -157,6 +173,11 @@ class Daemon:
             return f"{left / 86400:.1f}d left"
         self.client.publish_did_note(mailbox=self._mailbox())
         self.writes += 1
+        self.journal.record(
+            "keepalive",
+            f"refreshed /kv/{ns}/{key}; identity would otherwise have been deleted",
+            f"flopagent doctor",
+        )
         return "refreshed"
 
     def do_assist(self) -> str:
@@ -174,9 +195,18 @@ class Daemon:
         state.marks["answered"] = "|".join(sorted(answered))[-7000:]
         state.save()
         self.writes += len(done) * 2          # message + receipt
+        did = self.client.identity.did
         for candidate, _ in done:
             print(f"    helped /r/{candidate.room}#{candidate.seq} "
                   f"[{candidate.answer.key}]")
+            self.journal.record(
+                "helped",
+                f"answered /r/{candidate.room}#{candidate.seq} with "
+                f"{candidate.answer.key} ({candidate.answer.finding})",
+                f"flopagent audit {did} {candidate.room} <my reply seq>",
+                room=candidate.room, target_seq=candidate.seq,
+                answer=candidate.answer.key,
+            )
         return f"{len(done)} answered"
 
     def do_broadcast(self) -> str:
@@ -191,6 +221,13 @@ class Daemon:
         parts = publish(self.client, self.client.identity, corpus, directory,
                         self.namespace)
         self.writes += len(parts)
+        self.journal.record(
+            "broadcast",
+            f"republished {len(parts)} notes from {len(corpus.messages)} archived "
+            "messages, readable by any fetch-only agent",
+            f"curl https://technocore.chat/kv/{self.namespace}/index",
+            parts=[k for k, _ in parts],
+        )
         return f"{len(parts)} notes from {len(corpus.messages)} messages"
 
     @property

@@ -138,6 +138,12 @@ def main(argv: list[str] | None = None) -> int:
     rn.add_argument("--cycles", type=int, default=None, help="stop after N ticks")
     rn.add_argument("--db", default=None)
 
+    rep = sub.add_parser(
+        "report", help="what this agent has actually done, and how to check it"
+    )
+    rep.add_argument("--hours", type=float, default=None)
+    rep.add_argument("--journal", default=None)
+
     asst = sub.add_parser(
         "assist", help="answer messages this client has a verified answer for"
     )
@@ -287,6 +293,13 @@ def _dispatch(args) -> int:
             except KeyboardInterrupt:
                 pass
             print(f"stored {d.stored}, missed {d.missed}, writes {d.writes}")
+        return 0
+
+    if args.cmd == "report":
+        from .journal import Journal
+
+        path = args.journal or (Path(args.seed).parent / "journal.jsonl")
+        print(Journal(path).report(hours=args.hours))
         return 0
 
     if args.cmd == "assist":

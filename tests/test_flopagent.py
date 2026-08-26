@@ -9,6 +9,7 @@ Run:  python -m unittest discover -s tests -v
 
 from __future__ import annotations
 
+import json
 import pathlib
 import unittest
 
@@ -1017,3 +1018,58 @@ class TestStateConcurrency(unittest.TestCase):
         b.save()
         a.save()                                       # stale writer saves last
         self.assertEqual(self.State.load(self.path).note_writes["did-18/x"], 500.0)
+
+
+class TestJournal(unittest.TestCase):
+    """The operator's report. Its value is that entries are checkable."""
+
+    def setUp(self):
+        import tempfile
+        from flopagent.journal import Journal
+        self.Journal = Journal
+        self.path = pathlib.Path(tempfile.mkdtemp()) / "journal.jsonl"
+
+    def test_records_and_reads_back(self):
+        j = self.Journal(self.path)
+        j.record("helped", "answered /r/lobby#5", "flopagent audit did room 9")
+        rows = j.entries()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "helped")
+        self.assertIn("audit", rows[0]["evidence"])
+
+    def test_unknown_kinds_are_refused(self):
+        # Adding a kind should mean deciding how it is verified.
+        with self.assertRaises(ValueError):
+            self.Journal(self.path).record("vibes", "felt productive")
+
+    def test_append_only_survives_a_torn_line(self):
+        j = self.Journal(self.path)
+        j.record("note", "first", "x")
+        with self.path.open("a", encoding="utf-8") as fh:
+            fh.write('{"at": 1, "kind": "note", "wha')      # crash mid-write
+        j.record("note", "third", "z")
+        rows = j.entries()
+        self.assertEqual([r["what"] for r in rows], ["first", "third"])
+
+    def test_report_names_unverifiable_entries_as_claims(self):
+        j = self.Journal(self.path)
+        j.record("helped", "checkable thing", "flopagent audit ...")
+        j.record("note", "unbacked assertion")          # no evidence
+        report = j.report()
+        self.assertIn("verify: flopagent audit", report)
+        self.assertIn("claims, not results", report)
+
+    def test_report_windows_by_hours(self):
+        import time as _t
+        j = self.Journal(self.path)
+        j.record("note", "recent", "x")
+        rows = j.entries()
+        old = dict(rows[0], at=_t.time() - 48 * 3600, what="ancient")
+        with self.path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(old) + "\n")
+        self.assertIn("recent", j.report(hours=1))
+        self.assertNotIn("ancient", j.report(hours=1))
+        self.assertIn("ancient", j.report())
+
+    def test_empty_journal_says_so_rather_than_inventing(self):
+        self.assertIn("nothing recorded", self.Journal(self.path).report(hours=1))
