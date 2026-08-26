@@ -49,10 +49,12 @@ HEARTBEAT_EVERY = 300
 BROADCAST_EVERY = 3 * 3600
 FAUCET_EVERY = 900
 KEEPALIVE_EVERY = 3600
-#: Deliberately slow, with a low cap. Being wrong at volume is the failure mode
-#: that would discredit the rest of what this client publishes, and most cycles
-#: correctly find nothing to say.
-ASSIST_EVERY = 1200
+#: Fast, but narrow: it only ever considers messages that arrived since the last
+#: pass, and the per-run and per-room caps are unchanged. Speed matters because a
+#: question falls outside the addressable 200-message window in seconds on a busy
+#: room -- a correct answer twenty minutes later replies to something nobody can
+#: still reach. Most passes correctly find nothing to say.
+ASSIST_EVERY = 25
 
 
 @dataclass
@@ -80,6 +82,8 @@ class Daemon:
     writes: int = 0
     journal: Journal = field(default_factory=Journal)
     _assistant: object = None
+    #: ``(room, seq)`` of everything the last index pass brought in.
+    _fresh: set = field(default_factory=set)
 
     def __post_init__(self) -> None:
         check_name(self.nick, "nick")
@@ -108,9 +112,19 @@ class Daemon:
 
     def do_index(self) -> str:
         stored = missed = 0
+        before = {r: self.archive.cursor_for(r) or 0 for r in self.rooms}
         for result in self.archive.sweep(self.client, self.rooms):
             stored += result.stored
             missed += result.missed
+        # Remember exactly what is new, so assist can answer it while it is still
+        # inside the window a reader can address.
+        self._fresh = {
+            (r, row["seq"])
+            for r in self.rooms
+            for row in self.archive.db.execute(
+                "SELECT seq FROM messages WHERE room = ? AND seq > ?", (r, before[r])
+            ).fetchall()
+        }
         self.stored += stored
         self.missed += missed
         if stored:
@@ -191,7 +205,7 @@ class Daemon:
         answered = set(state.marks.get("answered", "").split("|")) - {""}
         corpus = corpus_from_archive(self.archive)
         done = self.assistant.act(self.client, corpus, self.client.identity.did,
-                                  answered)
+                                  answered, fresh=self._fresh or None)
         if not done:
             return "nothing answerable"
         state.marks["answered"] = "|".join(sorted(answered))[-7000:]

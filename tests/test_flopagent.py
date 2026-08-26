@@ -1149,3 +1149,54 @@ class TestJournalEvidenceIsReal(unittest.TestCase):
         candidate, text, reply_seq = done[0]     # three-tuple, not two
         self.assertIsNone(reply_seq)             # nothing posted on a dry run
         self.assertIn("lobby#1", text)
+
+
+class TestAssistFreshness(unittest.TestCase):
+    """A late answer replies to something nobody can still reach.
+
+    `limit` caps at 200 and there is no `at=`, so a question leaves the
+    addressable window once 200 more messages arrive -- seconds, on a busy room.
+    Candidates are therefore restricted to what just arrived, while the corpus
+    still spans everything so the template test keeps working.
+    """
+
+    def _corpus(self):
+        from flopagent.signal import Corpus, Message
+        corpus = Corpus()
+        corpus.add(Message("lobby", 10, "did:key:zOld",
+                           "does the server ever purge old nonces, or does that "
+                           "nonce table just grow forever as rooms age?"))
+        corpus.add(Message("lobby", 99, "did:key:zNew",
+                           "quick one: does the server keep every nonce forever, "
+                           "or does that table get purged at some point?"))
+        return corpus
+
+    def test_only_fresh_messages_are_answered(self):
+        from flopagent.assist import Assistant
+        found = Assistant().find(self._corpus(), "did:key:zMe", set(),
+                                 fresh={("lobby", 99)})
+        self.assertEqual([c.seq for c in found], [99])
+
+    def test_no_fresh_filter_considers_everything(self):
+        from flopagent.assist import Assistant
+        found = Assistant().find(self._corpus(), "did:key:zMe", set())
+        self.assertEqual(sorted(c.seq for c in found), [10, 99])
+
+    def test_an_empty_fresh_set_answers_nothing(self):
+        # A cycle that brought in no messages must not re-scan history.
+        from flopagent.assist import Assistant
+        self.assertEqual(
+            Assistant().find(self._corpus(), "did:key:zMe", set(), fresh=set()), [])
+
+    def test_the_template_index_still_spans_the_whole_corpus(self):
+        # Restricting candidates must not blind the shared-frame test, or a
+        # template arriving fresh would look original.
+        from flopagent.assist import Assistant
+        from flopagent.signal import Corpus, Message
+        corpus = Corpus()
+        line = ("does the server ever purge old nonces, or does that nonce table "
+                "just grow forever in this room?")
+        for i in range(4):                       # four independent keys: a template
+            corpus.add(Message("lobby", i, f"did:key:zK{i}", line))
+        found = Assistant().find(corpus, "did:key:zMe", set(), fresh={("lobby", 3)})
+        self.assertEqual(found, [])

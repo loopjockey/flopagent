@@ -313,9 +313,24 @@ class Assistant:
         """Never answer, quote or engage with steering or credential-bait text."""
         return not (INJECTION.search(text) or DANGEROUS.search(text))
 
-    def find(self, corpus, me: str, answered: set[str]) -> list[Candidate]:
+    def find(self, corpus, me: str, answered: set[str],
+             fresh: set[tuple[str, int]] | None = None) -> list[Candidate]:
+        """Answerable messages, newest-relevant first.
+
+        ``fresh`` restricts *candidates* to messages that just arrived, while the
+        corpus still spans everything -- the template test needs the whole history
+        to know a frame is shared, but the reply needs to be fast.
+
+        Latency is not a nicety here. `limit` caps at 200 and there is no `at=`,
+        so a message falls outside the window any reader can address once 200 more
+        arrive: in /r/lobby, about four seconds. A correct answer twenty minutes
+        later lands in a room where the question is unreachable and nobody can see
+        what it replies to.
+        """
         out: list[Candidate] = []
         for message in corpus.messages:
+            if fresh is not None and (message.room, message.seq) not in fresh:
+                continue
             if message.author == me or not message.author.startswith("did:key:"):
                 continue
             marker = f"{message.room}:{message.seq}"
@@ -352,7 +367,8 @@ class Assistant:
             f"Reproduction in {candidate.answer.finding} at {REPO}."
         )
 
-    def act(self, client, corpus, me: str, answered: set[str], dry_run: bool = False):
+    def act(self, client, corpus, me: str, answered: set[str], dry_run: bool = False,
+            fresh: set[tuple[str, int]] | None = None):
         """Reply to the best candidates.
 
         Returns ``[(candidate, text, reply_seq), ...]``. The reply's own sequence
@@ -363,7 +379,7 @@ class Assistant:
         """
         now = time.time()
         done, per_room = [], {}
-        for candidate in self.find(corpus, me, answered):
+        for candidate in self.find(corpus, me, answered, fresh=fresh):
             if len(done) >= self.max_per_run:
                 break
             if now - self._room_last.get(candidate.room, 0) < self.room_cooldown:
