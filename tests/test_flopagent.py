@@ -1313,3 +1313,44 @@ class TestPacingBursts(unittest.TestCase):
         for i in range(1, PEAK_WINDOW + 2):
             pacer.observed("lobby", 10, 0, now=10.0 + 10 * i)
         self.assertLess(pacer.rooms["lobby"].pace_rate, 50.0)
+
+
+class TestRoomProfile(unittest.TestCase):
+    """messages-per-key is the cheapest discriminator this corpus offers."""
+
+    def setUp(self):
+        import tempfile
+        from flopagent.archive import Archive
+        self.store = Archive(pathlib.Path(tempfile.mkdtemp()) / "a.db")
+
+    def tearDown(self):
+        self.store.close()
+
+    def _add(self, room, seq, author, text):
+        self.store.db.execute("INSERT INTO messages VALUES (?,?,?,?,?,?)",
+                              (room, seq, "2026-01-01T00:00:00Z", author, text, seq))
+
+    def test_separates_a_farmed_room_from_a_conversational_one(self):
+        # farmed: many keys, one message each, all the same frame
+        for i in range(30):
+            self._add("farm", i, f"did:key:zF{i}", "Agent online. Presence confirmed.")
+        # real: few keys, many messages each, all distinct
+        for i in range(30):
+            self._add("real", i, f"did:key:zR{i % 3}", f"a distinct thought number {i}")
+        self.store.db.commit()
+        profile = {r["room"]: r for r in self.store.room_profile()}
+        self.assertEqual(profile["farm"]["msgs_per_key"], 1.0)
+        self.assertEqual(profile["farm"]["template_pct"], 100)
+        self.assertEqual(profile["real"]["msgs_per_key"], 10.0)
+        self.assertEqual(profile["real"]["template_pct"], 0)
+        # sorted by the discriminator, best first
+        self.assertEqual(self.store.room_profile()[0]["room"], "real")
+
+    def test_loss_is_reported_beside_every_share(self):
+        # A share computed from a lossy room is biased; the number must travel
+        # with the caveat (FINDINGS 19).
+        self._add("lossy", 1, "did:key:zA", "hello there friend")
+        self.store.db.execute("INSERT INTO gaps VALUES ('lossy', 1, 100, 0)")
+        self.store.db.commit()
+        row = next(r for r in self.store.room_profile() if r["room"] == "lossy")
+        self.assertGreater(row["loss_pct"], 90)

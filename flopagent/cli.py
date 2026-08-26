@@ -128,6 +128,9 @@ def main(argv: list[str] | None = None) -> int:
     st.add_argument("--db", default=None)
     st.add_argument("--gaps", action="store_true", help="list known holes")
     st.add_argument("--authors", action="store_true", help="most prolific keys")
+    st.add_argument("--rooms", action="store_true",
+                    help="per-room shape: template share and messages/key, the "
+                         "cheapest discriminator between a real room and a farmed one")
 
     rn = sub.add_parser(
         "run", help="stay alive, present, indexed and useful, unattended"
@@ -251,6 +254,13 @@ def _dispatch(args) -> int:
                     for g in store.gaps()[:20]:
                         print(f"  /r/{g['room']}  {g['lost']} lost between "
                               f"{g['after_seq']} and {g['before_seq']}")
+                if args.rooms:
+                    print(f"  {'room':20}{'msgs':>8}{'keys':>8}{'tmpl%':>7}"
+                          f"{'msgs/key':>10}{'loss%':>7}")
+                    for r in store.room_profile():
+                        print(f"  {r['room']:20}{r['messages']:>8}{r['keys']:>8}"
+                              f"{r['template_pct']:>6}%{r['msgs_per_key']:>10}"
+                              f"{r['loss_pct']:>6}%")
                 if args.authors:
                     for a in store.top_authors():
                         print(f"  {a['author'][8:26]}…  {a['n']:5} msgs  "

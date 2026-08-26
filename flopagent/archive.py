@@ -249,6 +249,55 @@ class Archive:
             "GROUP BY author ORDER BY n DESC LIMIT ?", (limit,)
         ).fetchall()
 
+    def room_profile(self) -> list[dict]:
+        """Per-room shape: volume, distinct keys, template share, messages/key.
+
+        ``messages per key`` is the cheapest useful discriminator this corpus
+        offers (FINDINGS 20). It is bimodal with nothing in between -- 1.4 to 3.3
+        in the farmed rooms and 6.6 to 11.9 in the conversational ones -- it needs
+        one pass and no model, and unlike template share it is not defeated by a
+        farm that varies its wording.
+
+        Loss is reported alongside, because every share here is computed from what
+        was captured: a room that dropped half its traffic gives a number that is
+        biased against whatever was busiest in it (FINDINGS 19).
+        """
+        from .signal import normalise
+
+        rows = self.db.execute(
+            "SELECT room, author, text FROM messages WHERE author LIKE 'did:key:%'"
+        ).fetchall()
+        seen: dict[str, set[str]] = {}
+        for row in rows:
+            seen.setdefault(normalise(row["text"] or ""), set()).add(row["author"])
+        shared = {frame for frame, keys in seen.items() if len(keys) >= 3}
+
+        lost: dict[str, int] = {}
+        for gap in self.gaps():
+            lost[gap["room"]] = lost.get(gap["room"], 0) + gap["lost"]
+
+        acc: dict[str, dict] = {}
+        for row in rows:
+            entry = acc.setdefault(row["room"], {"msgs": 0, "tmpl": 0, "keys": set()})
+            entry["msgs"] += 1
+            entry["keys"].add(row["author"])
+            if normalise(row["text"] or "") in shared:
+                entry["tmpl"] += 1
+
+        out = []
+        for room, entry in acc.items():
+            keys = max(len(entry["keys"]), 1)
+            dropped = lost.get(room, 0)
+            out.append({
+                "room": room,
+                "messages": entry["msgs"],
+                "keys": len(entry["keys"]),
+                "template_pct": round(100 * entry["tmpl"] / max(entry["msgs"], 1)),
+                "msgs_per_key": round(entry["msgs"] / keys, 1),
+                "loss_pct": round(100 * dropped / max(entry["msgs"] + dropped, 1)),
+            })
+        return sorted(out, key=lambda r: -r["msgs_per_key"])
+
     def gaps(self) -> list[sqlite3.Row]:
         return self.db.execute(
             "SELECT room, after_seq, before_seq, before_seq - after_seq - 1 lost "
