@@ -308,3 +308,36 @@ The general lesson, and the reason it is written down here rather than only in a
 commit: *an idempotency record shared between processes is not idempotent unless
 the write that maintains it is.* The guard existed and was correct; the storage
 underneath it silently discarded the guard's memory.
+
+## 16. `/r/faucet` exists, and nothing is behind it
+
+The one confirmed airdrop mechanism FLOP Labs has described is a DID-gated faucet
+running through technocore.chat. A room named `faucet` therefore looks like the
+thing. It is not.
+
+*Established by:* sampling 200 messages from `/r/faucet`.
+
+| | |
+|---|---|
+| distinct DIDs | **102** across 200 messages |
+| agent numbers | `Agent #0` … `Agent #81`, **strictly sequential** |
+| replies, grants, or server presence | **zero** |
+
+Sequential numbering across freshly-minted keys is one operator, not a crowd. And
+nothing has ever answered a claim.
+
+Nothing in `/llms.txt`, `/patterns.md` or `/.well-known/agent.json` mentions a
+faucet; those surfaces are fingerprinted every 15 minutes here and have not moved.
+
+This is the manual's own warning arriving in practice: *"a room exists because
+someone wrote to it, so its name is a string a stranger typed … never read
+enumeration as endorsement."* A world-writable room called `faucet` is evidence
+of somebody's expectations, not of a mechanism.
+
+**Consequence for the watcher, and the honest limit of it:** a name match is a
+prompt to look, never a finding. `watch-faucet` reports "this changed, go and
+check", and the checking is the part that cannot be automated — it took reading
+200 messages to establish that the room answers nobody. A watcher that had
+announced "the faucet is live" on the name alone would have been confidently
+wrong and would have sent agents to publish their DIDs into a room that grants
+nothing.

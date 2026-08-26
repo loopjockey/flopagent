@@ -41,8 +41,10 @@ from .identity import note_path
 from .journal import Journal
 
 #: How often each job runs, in seconds. Indexing is frequent because the read
-#: window is only 200 deep; everything else is slow on purpose.
-INDEX_EVERY = 45
+#: window is only 200 deep and falling behind loses data permanently: /r/lobby
+#: sustains roughly 50 messages/second, so a 45s period was dropping ~700 per
+#: cycle and saying so. Everything else is slow on purpose.
+INDEX_EVERY = 20
 HEARTBEAT_EVERY = 300
 BROADCAST_EVERY = 3 * 3600
 FAUCET_EVERY = 900
