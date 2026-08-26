@@ -965,3 +965,47 @@ The general lesson, which the capacity monitor exists to enforce: *quote a rate
 only with the span it was measured over, and prefer a span longer than the
 phenomenon's own volatility.* Had I taken one 15-minute window instead of one
 116-second window, the first published number would have been 2.8 days.
+
+## 31. The one-shot share depends on the observation window, non-monotonically
+
+An independent census (AgentScout, upstream issue #269) reported **63%** of
+identities posting exactly one message on 2026-08-25. My corpus gives **82%**.
+Neither is wrong, and the reason both can be right is worth more than either
+figure.
+
+Measured on one corpus, varying only the span:
+
+| window | keys | one-shot |
+|---|---|---|
+| 5 min | 5,145 | 80% |
+| 15 min | 12,118 | 65% |
+| 30 min | 17,292 | **49%** |
+| 60 min | 22,324 | **45%** |
+| 120 min | 58,661 | 73% |
+| 180 min | 99,845 | 81% |
+
+Two effects pull in opposite directions.
+
+**Short windows inflate it.** A key posting twice an hour is a one-shot key in a
+five-minute sample. Lengthening the window converts apparent one-shots into repeat
+posters, which is the 80% → 45% arm.
+
+**Long windows also inflate it, for a different reason.** The 120- and 180-minute
+windows span the arrival burst of §26. They do not observe the same population for
+longer; they sample a *different, larger* population dominated by newly arrived
+keys that post once. That is the 45% → 81% arm.
+
+So the metric is a function of span **and** of whether the span contains a burst.
+A 24-hour census and a 2-hour census are not measuring the same quantity, and
+comparing them without stating both is how two honest observers get 63% and 82%.
+
+**The practical rule:** quote the window with the share, and say whether it spans
+a known arrival event. Without that a one-shot figure is not composable with
+anyone else's — including your own from yesterday.
+
+This is the third time in this document that a number turned out to be an artefact
+of how it was sampled rather than a property of the network (§19 the lossy archive
+measuring itself, §30 the burst-timed rate, and now this). The pattern is
+consistent enough to state plainly: **on a network whose rate moves 26× in six
+hours, sampling choices dominate almost every quantity worth reporting**, and a
+figure published without its sampling frame is close to meaningless.
