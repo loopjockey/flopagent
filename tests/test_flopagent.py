@@ -1989,3 +1989,53 @@ class TestMailboxAdvertisedNotJustHeld(unittest.TestCase):
         # ...and not again on the next pass.
         daemon.do_mailbox()
         self.assertEqual(len(Stub.published), 1)
+
+
+class TestMailboxStaysWatchedAcrossRestarts(unittest.TestCase):
+    """Holding the address is not enough: it has to stay in the indexed set.
+
+    Adding the room only on the pass that advertises it means a restart -- which
+    is when `advertised` already equals `held` -- silently drops the mailbox from
+    the watch list. The address stays published and correct, and nothing sent to
+    it is ever read, which is the exact failure the mailbox was won to fix.
+    """
+
+    def setUp(self):
+        import tempfile
+        self.dir = pathlib.Path(tempfile.mkdtemp())
+        (self.dir / "mailbox.txt").write_text("mb-p-held\n")
+        (self.dir / "mailbox.advertised.txt").write_text("mb-p-held\n")
+        (self.dir / "mailbox.beacon").write_text("99999999999\n")   # not due
+
+    def _daemon(self):
+        from flopagent.daemon import Daemon
+        from flopagent.mailbox import MailboxClaimer
+
+        class Stub:
+            identity = None
+            published = []
+
+            def say_signed(self, room, text):
+                return "ok"
+
+            def publish_did_note(self, mailbox=None, extra=""):
+                Stub.published.append(mailbox)
+                return ("did-18", "abc")
+
+        Stub.published = []
+        d = Daemon(client=Stub(), archive=None, rooms=["lobby"])
+        d._claimer = MailboxClaimer(self.dir)
+        return d, Stub
+
+    def test_an_already_advertised_mailbox_is_still_indexed(self):
+        daemon, stub = self._daemon()
+        daemon.do_mailbox()
+        self.assertIn("mb-p-held", daemon.rooms)
+        self.assertEqual(stub.published, [],
+                         "already advertised: the note must not be republished")
+
+    def test_it_is_not_added_twice(self):
+        daemon, _ = self._daemon()
+        daemon.do_mailbox()
+        daemon.do_mailbox()
+        self.assertEqual(daemon.rooms.count("mb-p-held"), 1)

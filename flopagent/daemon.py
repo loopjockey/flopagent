@@ -384,9 +384,12 @@ class Daemon:
         """
         status = self.claimer.attempt(self.client)
         won = self.claimer.held
+        if won and won not in self.rooms:
+            # Every pass, not only the one that wins it: after a restart the
+            # address is already advertised, and keying this off the publish
+            # branch would drop the mailbox out of the indexed set for good.
+            self.rooms.append(won)         # or nothing sent there is ever read
         if won and self.claimer.advertised != won:
-            if won not in self.rooms:
-                self.rooms.append(won)     # or nothing sent there is ever read
             self.client.publish_did_note(mailbox=won)
             self.claimer.advertised = won
             self.writes += 1
