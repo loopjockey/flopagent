@@ -2039,3 +2039,55 @@ class TestMailboxStaysWatchedAcrossRestarts(unittest.TestCase):
         daemon.do_mailbox()
         daemon.do_mailbox()
         self.assertEqual(daemon.rooms.count("mb-p-held"), 1)
+
+
+class TestBroadcastCapacityPart(unittest.TestCase):
+    """Network capacity has no room that will carry it.
+
+    The rooms where it matters are template floods, so a capacity reading posted
+    there is read by nobody. The feed is the honest channel for it: fetch-only,
+    signed, and pollable -- and the daemon already measures it every 15 minutes.
+    """
+
+    def setUp(self):
+        from flopagent import broadcast as B
+        self.B = B
+        self.identity = Identity.from_seed(RFC8032_SEED)
+
+        class Corpus:
+            _authors_by_sentence = {}
+
+            def stats(self):
+                return {"messages": 1, "keys": 1, "template_pct": 0}
+
+            def ranked(self, min_novelty=0.0):
+                return []
+
+        self.corpus = Corpus()
+
+        class Client:
+            def __init__(self):
+                self.notes = {}
+
+            def write_note(self, ns, key, value):
+                self.notes[key] = value
+        self.client = Client()
+
+    def test_capacity_is_published_and_indexed_when_given(self):
+        written = self.B.publish(
+            self.client, self.identity, self.corpus, [],
+            capacity="notes 267136/327680 81.5% rate 7434/h",
+        )
+        self.assertIn("capacity-1", self.client.notes)
+        self.assertIn("capacity-1", self.client.notes["index"],
+                      "the index must name every part that exists")
+        decoded = self.B.Broadcast.decode(self.client.notes["capacity-1"])
+        self.assertTrue(decoded.verified(), "an unsigned reading is worthless")
+        self.assertIn("81.5%", decoded.payload)
+        self.assertIn(("capacity-1"), [k for k, _ in written])
+
+    def test_no_capacity_part_when_there_is_no_reading(self):
+        self.B.publish(self.client, self.identity, self.corpus, [])
+        self.assertNotIn("capacity-1", self.client.notes)
+        self.assertNotIn("capacity-1", self.client.notes["index"],
+                         "advertising a part that was never written strands readers")

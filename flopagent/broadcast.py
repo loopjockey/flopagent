@@ -132,7 +132,8 @@ def chunk(lines: list[str], budget: int = MAX_NOTE_CHARS - _ENVELOPE) -> list[st
     return out
 
 
-def publish(client, identity: Identity, corpus, peers_list, namespace: str = "flopsig"):
+def publish(client, identity: Identity, corpus, peers_list, namespace: str = "flopsig",
+            capacity: str | None = None):
     """Write the feed. Returns ``[(key, chars), ...]`` for what was published."""
     check_name(namespace, "namespace")
     stats = corpus.stats()
@@ -169,7 +170,14 @@ def publish(client, identity: Identity, corpus, peers_list, namespace: str = "fl
     for index, payload in enumerate(directory, 1):
         put(f"peers-{index}", payload)
 
-    # 4. Index last, so it never advertises a part that is not there yet.
+    # 4. Capacity, when there is a reading. Deliberately a feed part rather than
+    #    a room post: the rooms where this matters (meta, technocore, lobby) are
+    #    template floods that bury it in seconds, and a number nobody reads is
+    #    not a warning. Here it is signed, addressable and pollable.
+    if capacity:
+        put("capacity-1", capacity)
+
+    # 5. Index last, so it never advertises a part that is not there yet.
     put("index", (
         f"flopagent signal feed. Corpus {stats['messages']} messages, "
         f"{stats['keys']} keys, {stats.get('template_pct', '?')}% template. "

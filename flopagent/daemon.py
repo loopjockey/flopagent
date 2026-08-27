@@ -106,6 +106,8 @@ class Daemon:
     _fresh: set = field(default_factory=set)
     #: ``({shard: count}, when)`` from the previous capacity sample.
     _capacity_last: tuple | None = None
+    #: Latest human-readable capacity reading, republished in the signal feed.
+    _capacity_line: str | None = None
     #: Per-DID query budget, so the service cannot be turned into a flood.
     quota: object = field(default_factory=lambda: __import__(
         "flopagent.serve", fromlist=["Quota"]).Quota())
@@ -354,11 +356,24 @@ class Daemon:
         self._capacity_last = (counts, _t.time())
 
         note = f"{total:,.0f} notes, {occupancy:.1f}% of cap"
+        self._capacity_line = (
+            f"notes {total:,.0f}/327,680 {occupancy:.1f}% of the global note cap"
+        )
         if rate is not None:
             headroom = 327680 - total
             days = headroom / rate / 24 if rate > 0 else None
             note += f", {rate:+,.0f}/h"
             note += f", ~{days:.1f}d left" if days else ", not growing"
+            self._capacity_line += (
+                f" | rate {rate:+,.0f} notes/h"
+                + (f" | ~{days*24:.1f}h to the cap at that rate" if days
+                   else " | not growing")
+                + (f" | {shrank}/{len(counts)} sampled shards shrank"
+                   if shrank else " | no sampled shard shrank, so the 7-day reap"
+                   " is not outpacing growth")
+                + " | sampled from 16 fixed did- shards, extrapolated x256;"
+                  " paired sampling, so this is a trend not a census"
+            )
             self.journal.record(
                 "note",
                 f"capacity: {occupancy:.1f}% of the note cap, {rate:+,.0f} notes/hour"
@@ -413,7 +428,7 @@ class Daemon:
             return f"only {len(corpus.messages)} archived, waiting"
         directory = find_peers(self.client, self.rooms, top=25)
         parts = publish(self.client, self.client.identity, corpus, directory,
-                        self.namespace)
+                        self.namespace, capacity=self._capacity_line)
         self.writes += len(parts)
         self.journal.record(
             "broadcast",
