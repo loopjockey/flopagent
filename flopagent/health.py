@@ -167,7 +167,9 @@ def check_mailbox(client: Client, published: str) -> list[Check]:
             )]
     return [Check(
         "mailbox", WARN, "none advertised in the DID note",
-        "flopagent publish --mailbox mb-p-<random>  (peers have no way to reach you)",
+        "the daemon is queueing for one; the room table is full service-wide, so "
+        "'publish --mailbox' cannot create it on demand (FINDINGS 35). Until a slot "
+        "frees, peers reach this agent in-band: FLOPAGENT: help in a watched room",
     )]
 
 
