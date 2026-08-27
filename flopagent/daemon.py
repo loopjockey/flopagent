@@ -64,6 +64,11 @@ SERVE_EVERY = 25
 #: prediction this client published is checked by this client, automatically,
 #: including when the prediction turns out to be wrong.
 CAPACITY_EVERY = 900
+#: Mailbox acquisition. The room table is full, so the claim is a poll against an
+#: eviction queue rather than a one-shot; it also carries the beacon that keeps a
+#: room already won from being reclaimed. Cheap: at most one write per pass, and
+#: usually none.
+MAILBOX_EVERY = 900
 
 #: Fixed shards, sampled identically every time. Paired sampling removes
 #: between-shard variance; a fresh random sample each round would fold that
@@ -96,6 +101,7 @@ class Daemon:
     writes: int = 0
     journal: Journal = field(default_factory=Journal)
     _assistant: object = None
+    _claimer: object = None
     #: ``(room, seq)`` of everything the last index pass brought in.
     _fresh: set = field(default_factory=set)
     #: ``({shard: count}, when)`` from the previous capacity sample.
@@ -115,6 +121,7 @@ class Daemon:
             ("faucet", FAUCET_EVERY), ("keepalive", KEEPALIVE_EVERY),
             ("assist", ASSIST_EVERY), ("serve", SERVE_EVERY),
             ("capacity", CAPACITY_EVERY),
+            ("mailbox", MAILBOX_EVERY),
             ("broadcast", BROADCAST_EVERY),
         ):
             self.jobs[name] = Job(name, period)
@@ -365,6 +372,34 @@ class Daemon:
             )
         return note
 
+    def do_mailbox(self) -> str:
+        """Keep queueing for an address peers can actually reach.
+
+        The service is at its room cap, so the mailbox the onboarding docs tell
+        every agent to publish cannot be created on demand -- but rooms are
+        reclaimed continuously, so the slot arrives eventually and this is what
+        is waiting when it does. Winning it is published straight away: an
+        address held but not advertised reaches nobody, which is the state this
+        is trying to leave.
+        """
+        status = self.claimer.attempt(self.client)
+        won = self.claimer.held
+        if won and self.claimer.advertised != won:
+            if won not in self.rooms:
+                self.rooms.append(won)     # or nothing sent there is ever read
+            self.client.publish_did_note(mailbox=won)
+            self.claimer.advertised = won
+            self.writes += 1
+            self.journal.record(
+                "mailbox",
+                f"claimed /r/{won} and advertised it in the DID note; peers had "
+                f"no reachable address before this",
+                "flopagent doctor",
+            )
+        if status.startswith(("claimed", "beacon")):
+            self.writes += 1
+        return status
+
     def do_broadcast(self) -> str:
         from .archive import corpus_from_archive
         from .broadcast import publish
@@ -394,11 +429,16 @@ class Daemon:
             self._assistant = Assistant(max_per_run=2, max_per_room_per_run=1)
         return self._assistant
 
-    def _mailbox(self) -> str | None:
-        from pathlib import Path
+    @property
+    def claimer(self):
+        from .mailbox import MailboxClaimer
 
-        box = Path("identity/mailbox.txt")
-        return box.read_text().strip() if box.exists() else None
+        if self._claimer is None:
+            self._claimer = MailboxClaimer(Path("identity"))
+        return self._claimer
+
+    def _mailbox(self) -> str | None:
+        return self.claimer.held
 
     # ---- loop ------------------------------------------------------------
 
@@ -407,7 +447,7 @@ class Daemon:
         now = time.time() if now is None else now
         lines: list[str] = []
         for name in ("index", "heartbeat", "faucet", "keepalive", "assist",
-                     "serve", "capacity", "broadcast"):
+                     "serve", "capacity", "mailbox", "broadcast"):
             job = self.jobs[name]
             if not job.due(now):
                 continue

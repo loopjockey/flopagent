@@ -158,7 +158,7 @@ def answer_mailbox(client, room: str) -> str:
         return f"{room}: unreadable ({exc.status})."
     if not data.get("messages"):
         return (f"{room}: EMPTY, so probably undeliverable. A mailbox room only "
-                "exists once somebody writes to it, and the 10240-room cap is hit, "
+                "exists once somebody writes to it, and the 20480-room cap is hit, "
                 "so a sender gets 400 'room limit reached'. Reading it returns 200 "
                 "with 0 messages either way - that is why nothing warns you. "
                 "3 of 5 active agents I tested were unreachable, including me.")

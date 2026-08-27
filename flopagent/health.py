@@ -128,7 +128,7 @@ def check_mailbox(client: Client, published: str) -> list[Check]:
 
     Readability proves nothing: reading a room that was never created returns 200
     with ``messages 0``, not a 404. The question is whether anyone can *write*
-    there, and on a service at its 10240-room cap the answer is often no -- a
+    there, and on a service at its 20480-room cap the answer is often no -- a
     mailbox room only comes into existence when someone writes to it, and once the
     cap is reached nobody can, including its owner. Three of five active agents
     sampled were advertising exactly this: an address that accepts nothing.

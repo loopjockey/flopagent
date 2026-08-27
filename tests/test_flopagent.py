@@ -1782,3 +1782,210 @@ class TestDominationIsScaleFree(unittest.TestCase):
         row = next(r for r in self.store.room_profile() if r["room"] == "kibbleish")
         self.assertEqual(row["median_per_key"], 1)
         self.assertGreater(row["msgs_per_key"], 5)
+
+
+class TestMailboxClaimer(unittest.TestCase):
+    """Acquiring a mailbox on a service whose room table is full.
+
+    A mailbox room only exists once somebody writes to it, and on a saturated
+    service that write is refused -- so the address in the DID note is an
+    address nobody can reach. Slots do free up (an idle room is reclaimed after
+    7 days, one still on its first message after 24 hours), so the claim is a
+    retry against a queue, not a one-shot that failed.
+    """
+
+    def setUp(self):
+        import tempfile
+        from flopagent.mailbox import MailboxClaimer
+
+        self.dir = pathlib.Path(tempfile.mkdtemp())
+        self.clock = [1000.0]
+        self.make = lambda: MailboxClaimer(
+            self.dir, now=lambda: self.clock[0]
+        )
+
+    class _Service:
+        """Accepts writes only once it has a free room slot."""
+
+        def __init__(self, full=True, existing=()):
+            self.full = full
+            self.rooms = dict.fromkeys(existing, 1)
+            self.writes = []
+
+        def say_signed(self, room, text):
+            from flopagent.client import TechnocoreError
+
+            if room not in self.rooms and self.full:
+                raise TechnocoreError(
+                    400,
+                    "room limit reached (20480 is the cap, and this would be a "
+                    "new one). Existing rooms still accept writes",
+                    "https://technocore.chat/r/" + room,
+                )
+            self.rooms[room] = self.rooms.get(room, 0) + 1
+            self.writes.append((room, text))
+            return "ok"
+
+    def test_pending_name_is_a_valid_mb_room_and_is_stable(self):
+        claimer = self.make()
+        first = claimer.pending
+        self.assertTrue(first.startswith("mb-p-"))
+        # A fresh instance over the same directory must offer the same address,
+        # or every retry advertises somewhere different.
+        self.assertEqual(self.make().pending, first)
+
+    def test_a_full_service_leaves_no_mailbox_held(self):
+        claimer = self.make()
+        status = claimer.attempt(self._Service(full=True))
+        self.assertIn("cap full", status)
+        self.assertIsNone(claimer.held)
+        self.assertFalse((self.dir / "mailbox.txt").exists())
+
+    def test_a_freed_slot_is_claimed_and_recorded(self):
+        claimer = self.make()
+        service = self._Service(full=True)
+        self.assertIn("cap full", claimer.attempt(service))
+        service.full = False                       # a room was reclaimed
+        status = claimer.attempt(service)
+        self.assertIn("claimed", status)
+        self.assertEqual(claimer.held, claimer.pending)
+        self.assertEqual((self.dir / "mailbox.txt").read_text().strip(),
+                         claimer.held)
+
+    def test_the_claim_reuses_the_address_that_was_pending(self):
+        claimer = self.make()
+        wanted = claimer.pending
+        service = self._Service(full=False)
+        claimer.attempt(service)
+        self.assertEqual(service.writes[0][0], wanted)
+
+    def test_a_held_mailbox_is_not_reclaimed_before_its_beacon_is_due(self):
+        claimer = self.make()
+        service = self._Service(full=False)
+        claimer.attempt(service)
+        self.assertEqual(len(service.writes), 1)
+        self.clock[0] += 60
+        self.assertIn("held", claimer.attempt(service))
+        self.assertEqual(len(service.writes), 1)   # no needless write
+
+    def test_a_held_mailbox_is_beaconed_before_the_24_hour_reclaim(self):
+        from flopagent.mailbox import BEACON_EVERY
+
+        claimer = self.make()
+        service = self._Service(full=False)
+        claimer.attempt(service)
+        self.assertLess(BEACON_EVERY, 24 * 3600,
+                        "a beacon due after the reclaim is no beacon at all")
+        self.clock[0] += BEACON_EVERY + 1
+        self.assertIn("beacon", claimer.attempt(service))
+        self.assertEqual(len(service.writes), 2)
+
+    def test_an_unrelated_failure_is_not_swallowed_as_a_full_service(self):
+        from flopagent.client import TechnocoreError
+
+        class Broken(self._Service):
+            def say_signed(self, room, text):
+                raise TechnocoreError(429, "slow down", "u")
+
+        status = self.make().attempt(Broken())
+        self.assertNotIn("claimed", status)
+        self.assertIn("429", status)
+        self.assertIsNone(self.make().held)
+
+    def test_a_previously_abandoned_address_is_reused_not_replaced(self):
+        (self.dir / "mailbox.unreachable.txt").write_text(
+            "mb-p-de063b410906c3f41ac7\n")
+        self.assertEqual(self.make().pending, "mb-p-de063b410906c3f41ac7")
+
+
+class TestDaemonMailboxJob(unittest.TestCase):
+    """Winning the slot has to change what the network can see, not just disk."""
+
+    def _daemon(self, directory, service):
+        from flopagent.daemon import Daemon
+
+        class Stub:
+            identity = None
+            published = []
+
+            def say_signed(self, room, text):
+                return service.say_signed(room, text)
+
+            def publish_did_note(self, mailbox=None, extra=""):
+                Stub.published.append(mailbox)
+                return ("did-18", "abc")
+
+        Stub.published = []
+        daemon = Daemon(client=Stub(), archive=None, rooms=["lobby"])
+        from flopagent.mailbox import MailboxClaimer
+        daemon._claimer = MailboxClaimer(directory)
+        return daemon, Stub
+
+    def setUp(self):
+        import tempfile
+        self.dir = pathlib.Path(tempfile.mkdtemp())
+
+    def test_a_full_service_advertises_nothing(self):
+        service = TestMailboxClaimer._Service(full=True)
+        daemon, stub = self._daemon(self.dir, service)
+        self.assertIn("cap full", daemon.do_mailbox())
+        self.assertEqual(stub.published, [],
+                         "an address that does not exist must not be advertised")
+        self.assertNotIn("mb-", " ".join(daemon.rooms))
+
+    def test_a_won_mailbox_is_advertised_and_watched(self):
+        service = TestMailboxClaimer._Service(full=False)
+        daemon, stub = self._daemon(self.dir, service)
+        self.assertIn("claimed", daemon.do_mailbox())
+        won = daemon.claimer.held
+        self.assertEqual(stub.published, [won])
+        self.assertIn(won, daemon.rooms,
+                      "a mailbox nothing indexes is a mailbox nothing answers")
+
+    def test_the_note_is_not_republished_on_every_later_pass(self):
+        service = TestMailboxClaimer._Service(full=False)
+        daemon, stub = self._daemon(self.dir, service)
+        daemon.do_mailbox()
+        daemon.do_mailbox()
+        daemon.do_mailbox()
+        self.assertEqual(len(stub.published), 1)
+        self.assertEqual(daemon.rooms.count(daemon.claimer.held), 1)
+
+
+class TestMailboxAdvertisedNotJustHeld(unittest.TestCase):
+    """Publishing must follow from *being unadvertised*, not from the moment won.
+
+    Comparing against "did this pass win it" only advertises a mailbox claimed by
+    this exact process. One claimed by a previous run, or by hand, stays held and
+    unadvertised forever -- which is the original failure wearing a different hat.
+    """
+
+    def setUp(self):
+        import tempfile
+        self.dir = pathlib.Path(tempfile.mkdtemp())
+
+    def test_a_mailbox_won_before_this_process_started_is_advertised(self):
+        from flopagent.daemon import Daemon
+        from flopagent.mailbox import MailboxClaimer
+
+        (self.dir / "mailbox.txt").write_text("mb-p-alreadymine\n")
+
+        class Stub:
+            identity = None
+            published = []
+
+            def say_signed(self, room, text):
+                return "ok"
+
+            def publish_did_note(self, mailbox=None, extra=""):
+                Stub.published.append(mailbox)
+                return ("did-18", "abc")
+
+        daemon = Daemon(client=Stub(), archive=None, rooms=["lobby"])
+        daemon._claimer = MailboxClaimer(self.dir)
+        daemon.do_mailbox()
+        self.assertEqual(Stub.published, ["mb-p-alreadymine"])
+        self.assertIn("mb-p-alreadymine", daemon.rooms)
+        # ...and not again on the next pass.
+        daemon.do_mailbox()
+        self.assertEqual(len(Stub.published), 1)

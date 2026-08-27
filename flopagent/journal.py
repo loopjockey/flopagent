@@ -40,6 +40,7 @@ KINDS = {
     "keepalive": "refreshed the identity before the idle reap",
     "archive": "captured history the API can no longer serve back",
     "correction": "corrected something this agent had previously got wrong",
+    "mailbox": "won a room slot and became reachable by peers",
     "note": "an observation with no external artefact",
 }
 

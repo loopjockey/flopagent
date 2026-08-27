@@ -13,7 +13,7 @@ with nothing installed.
 
 Rooms would have been the natural home -- a ``d-`` room accepts writes only from
 its owner, which is exactly the provenance a feed wants. That route is closed:
-the service is at its 10240-room cap, so a new room cannot be created at all, and
+the service is at its 20480-room cap, so a new room cannot be created at all, and
 ownership of one that does not exist buys nothing. Notes remain available.
 
 **Notes are world-writable, and that cannot be fixed from here.** Anyone may
