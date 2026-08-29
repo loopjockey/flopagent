@@ -2197,6 +2197,13 @@ class TestReadWindow(unittest.TestCase):
         self.assertIn("kibble", line)
         self.assertIn("400s", line)           # 200/0.5, the quiet end
 
+    def test_a_very_slow_room_is_reported_per_hour_not_as_zero(self):
+        """"0.0 msg/s, window ~20095s" reads as a contradiction and gets ignored."""
+        from flopagent.daemon import window_line
+        line = window_line({"chat": 0.01}, {})
+        self.assertNotIn("0.0 msg/s", line)
+        self.assertIn("36 msg/h", line)
+
     def test_an_unmeasured_room_is_left_out_rather_than_guessed(self):
         from flopagent.daemon import window_line
         self.assertEqual(window_line({"lobby": 0.0}, {}), "")
@@ -2212,10 +2219,45 @@ class TestReadWindow(unittest.TestCase):
         self.assertTrue(job.due(now + 121))
         self.assertEqual(job.period, 10800, "the period is the pacing, not this")
 
-    def test_retry_never_pushes_a_due_job_further_out(self):
-        import time
-        from flopagent.daemon import Job
+    def test_tick_does_not_clobber_a_schedule_the_job_moved_itself(self):
+        """The unit test for retry_in passed while the feature did nothing.
+
+        `tick` stamped `job.last = now` after every run, so a job asking to come
+        back early had its request overwritten one line later. Nothing caught it
+        because retry_in was only ever tested on its own.
+        """
+        import tempfile, time
+        from flopagent.archive import Archive
+        from flopagent.daemon import Daemon
+        from flopagent.journal import Journal
+
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        d = Daemon(client=object(), archive=Archive(tmp / "a.db"), rooms=[],
+                   journal=Journal(tmp / "j.jsonl"))
+        d.do_faucet = lambda: (d.jobs["faucet"].retry_in(60, time.time()), "asked")[1]
         now = time.time()
-        job = Job("broadcast", period=10800, last=now - 20000)   # overdue
-        job.retry_in(300, now)
-        self.assertTrue(job.due(now), "an overdue job must not be delayed by a retry")
+        for job in d.jobs.values():           # only the one job is due
+            job.last = now
+        d.jobs["faucet"].last = now - d.jobs["faucet"].period
+        d.tick(now)
+        self.assertTrue(d.jobs["faucet"].due(now + 61),
+                        "the job asked to come back in 60s and tick overwrote it")
+
+    def test_the_early_retry_is_one_shot_not_a_new_period(self):
+        import tempfile, time
+        from flopagent.archive import Archive
+        from flopagent.daemon import Daemon
+        from flopagent.journal import Journal
+
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        d = Daemon(client=object(), archive=Archive(tmp / "a.db"), rooms=[],
+                   journal=Journal(tmp / "j.jsonl"))
+        now = time.time()
+        for job in d.jobs.values():
+            job.last = now
+        d.do_faucet = lambda: "ran"
+        d.jobs["faucet"].next_at = now                     # as if asked earlier
+        d.tick(now)
+        self.assertIsNone(d.jobs["faucet"].next_at,
+                          "an unrepeated ask must not become the new period")
+        self.assertFalse(d.jobs["faucet"].due(now + 1))

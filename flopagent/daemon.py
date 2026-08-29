@@ -100,7 +100,11 @@ def window_line(rates: dict, captured: dict, read_limit: int = READ_LIMIT) -> st
         if rate <= 0:
             continue
         seconds = read_limit / rate
-        part = f"{room} {rate:.1f} msg/s, window ~{seconds:.0f}s"
+        # A room at 0.006/s renders as "0.0 msg/s" beside a five-hour window,
+        # which reads as a contradiction and gets the line dismissed. Below a
+        # tenth of a message per second, per hour is the honest unit.
+        shown = f"{rate:.1f} msg/s" if rate >= 0.1 else f"{rate * 3600:.0f} msg/h"
+        part = f"{room} {shown}, window ~{seconds:.0f}s"
         if room in captured:
             part += f", I captured {captured[room]:.1f}%"
         parts.append(part)
@@ -123,19 +127,26 @@ class Job:
     name: str
     period: float
     last: float = 0.0
+    #: One-shot override of the period, set by the job itself; see retry_in.
+    next_at: float | None = None
     runs: int = 0
     errors: int = 0
 
     def due(self, now: float) -> bool:
+        if self.next_at is not None:
+            return now >= self.next_at
         return now - self.last >= self.period
 
     def retry_in(self, seconds: float, now: float) -> None:
-        """Come back sooner than the period, without changing the period.
+        """Ask to run again in ``seconds``, once, without changing the period.
 
-        For a job that ran but could not do all of its work yet. Never used to
-        make a job faster in general -- the periods are the pacing.
+        For a job that ran but could not finish its work -- the first broadcast
+        after a start has no measured room rates yet. The override is a separate
+        field rather than a doctored ``last`` because ``tick`` stamps ``last``
+        after every run, so anything written there is overwritten one line
+        later. That is exactly the bug this replaced.
         """
-        self.last = min(self.last, now - self.period + seconds)
+        self.next_at = now + seconds
 
 
 @dataclass
@@ -549,6 +560,9 @@ class Daemon:
             job = self.jobs[name]
             if not job.due(now):
                 continue
+            # Cleared before the run, so a job that asks again during it keeps
+            # what it asked for and one that does not returns to its period.
+            job.next_at = None
             try:
                 detail = getattr(self, f"do_{name}")()
                 job.runs += 1
