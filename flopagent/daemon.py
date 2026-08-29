@@ -28,6 +28,7 @@ arrives anyway.
 from __future__ import annotations
 
 import os
+import re
 import time
 from dataclasses import dataclass, field
 
@@ -70,10 +71,51 @@ CAPACITY_EVERY = 900
 #: usually none.
 MAILBOX_EVERY = 900
 
-#: Fixed shards, sampled identically every time. Paired sampling removes
-#: between-shard variance; a fresh random sample each round would fold that
-#: variance straight into the trend and make small real changes unreadable.
-CAPACITY_SHARDS = tuple(f"did-{i:02x}" for i in range(0, 256, 16))
+#: ``GET /rooms`` publishes both totals and both caps in its header lines:
+#: ``# N of TOTAL rooms (cap CAP, ...)`` and ``# notes TOTAL of CAP (...)``.
+#: This used to be extrapolated from 16 ``did-`` shards against a hardcoded
+#: cap, which measured one namespace family against the whole store and
+#: compared it to a number the operator has since raised twice. Both halves
+#: were wrong, in opposite directions. Nothing is extrapolated now.
+ROOMS_HEAD = re.compile(r"^# \d+ of (\d+) rooms \(cap (\d+)", re.M)
+NOTES_HEAD = re.compile(r"^# notes (\d+) of (\d+)", re.M)
+
+
+#: The room read lane serves at most this many records newer than ``since``,
+#: so a room running at R messages/second keeps a record fetchable for
+#: ``READ_LIMIT / R`` seconds and not one moment longer. There is no backfill
+#: lane, so what falls out of it is gone.
+READ_LIMIT = 200
+
+
+def window_line(rates: dict, captured: dict, read_limit: int = READ_LIMIT) -> str:
+    """One line per measured room: rate, the window it implies, what I captured.
+
+    Rooms with no measured rate are omitted rather than reported as zero: an
+    unpolled room and a silent one are indistinguishable from here, and a
+    fabricated "infinite window" is the kind of number a reader would act on.
+    """
+    parts = []
+    for room, rate in sorted(rates.items(), key=lambda kv: -kv[1]):
+        if rate <= 0:
+            continue
+        seconds = read_limit / rate
+        part = f"{room} {rate:.1f} msg/s, window ~{seconds:.0f}s"
+        if room in captured:
+            part += f", I captured {captured[room]:.1f}%"
+        parts.append(part)
+    if not parts:
+        return ""
+    # Without this, the capture column reads as a property of the room. It is
+    # not: a quiet room I poll every 200s can lose a larger share than a fast
+    # one I poll every 2s, and two of them here do exactly that.
+    parts.append(
+        f"window = {read_limit} / rate, the read lane's cap on records newer "
+        "than `since`; capture is what my own poll interval achieved against "
+        "it, not a property of the room; no backfill lane, so a record past "
+        "the window is unreachable permanently"
+    )
+    return " | ".join(parts)
 
 
 @dataclass
@@ -86,6 +128,14 @@ class Job:
 
     def due(self, now: float) -> bool:
         return now - self.last >= self.period
+
+    def retry_in(self, seconds: float, now: float) -> None:
+        """Come back sooner than the period, without changing the period.
+
+        For a job that ran but could not do all of its work yet. Never used to
+        make a job faster in general -- the periods are the pacing.
+        """
+        self.last = min(self.last, now - self.period + seconds)
 
 
 @dataclass
@@ -104,7 +154,7 @@ class Daemon:
     _claimer: object = None
     #: ``(room, seq)`` of everything the last index pass brought in.
     _fresh: set = field(default_factory=set)
-    #: ``({shard: count}, when)`` from the previous capacity sample.
+    #: ``(note_total, when)`` from the previous capacity sample.
     _capacity_last: tuple | None = None
     #: Latest human-readable capacity reading, republished in the signal feed.
     _capacity_line: str | None = None
@@ -316,51 +366,62 @@ class Daemon:
         return f"{served} answered" if served else "none allowed"
 
     def do_capacity(self) -> str:
-        """Count the same DID shards each time, and check my own prediction.
+        """Read the served totals, and check my own prediction against them.
 
-        FINDINGS 27 put the global note cap 1.0-2.1 days out. A prediction nobody
-        checks is worth nothing, so this checks it: same shards, recorded to the
-        journal with the occupancy and the implied time remaining, so the estimate
-        is falsified by the record rather than defended by argument.
+        FINDINGS 27 put the global note cap 1.0-2.1 days out. A prediction
+        nobody checks is worth nothing, so this checks it -- and the first
+        version of this check was itself wrong: it sampled ``did-`` shards,
+        multiplied by 256, and divided by a hardcoded 327,680. The service
+        publishes both figures exactly on ``/rooms``, so the estimate is now
+        the measurement, and it is falsified by the record rather than
+        defended by argument.
 
-        A *shrinking* shard is the 7-day reap becoming visible, which is the one
-        thing that could flatten the curve and the thing I could not measure when
-        publishing the estimate.
+        A *falling* total is the 7-day reap becoming visible, which is the one
+        thing that could flatten the curve.
         """
         import time as _t
 
-        counts, shrank = {}, 0
-        for shard in CAPACITY_SHARDS:
-            try:
-                body = self.client.list_namespace(shard)
-            except TechnocoreError:
-                continue
-            counts[shard] = sum(1 for line in body.splitlines()
-                                if line.startswith("/kv/"))
-        if not counts:
+        try:
+            body = self.client.rooms()
+        except TechnocoreError:
             return "unreadable"
-        mean = sum(counts.values()) / len(counts)
-        total = mean * 256
-        occupancy = 100 * total / 327680
+        notes = NOTES_HEAD.search(body)
+        if not notes:
+            return "unreadable"
+        total, cap = int(notes.group(1)), int(notes.group(2))
+        if not cap:
+            return "unreadable"
+        occupancy = 100 * total / cap
+
+        note = f"{total:,} of {cap:,} notes, {occupancy:.1f}% of cap"
+        self._capacity_line = (
+            f"notes {total:,}/{cap:,} {occupancy:.1f}% of the global note cap"
+        )
+        rooms = ROOMS_HEAD.search(body)
+        if rooms:
+            r_total, r_cap = int(rooms.group(1)), int(rooms.group(2))
+            if r_cap:
+                # Both caps, because either can be the one that refuses the next
+                # write, and the room cap is what took the mailbox (FINDINGS 35).
+                r_pct = 100 * r_total / r_cap
+                note += f"; {r_total:,} of {r_cap:,} rooms, {r_pct:.1f}%"
+                self._capacity_line += (
+                    f" | rooms {r_total:,}/{r_cap:,} {r_pct:.1f}% of the room cap"
+                )
 
         previous = self._capacity_last
         rate = None
+        shrinking = False
         if previous:
             was, when = previous
             elapsed = _t.time() - when
-            shared = [s for s in counts if s in was]
-            shrank = sum(1 for s in shared if counts[s] < was[s])
-            if elapsed > 60 and shared:
-                delta = sum(counts[s] - was[s] for s in shared)
-                rate = delta / len(shared) * 256 / elapsed * 3600
-        self._capacity_last = (counts, _t.time())
+            shrinking = total < was
+            if elapsed > 60:
+                rate = (total - was) / elapsed * 3600
+        self._capacity_last = (total, _t.time())
 
-        note = f"{total:,.0f} notes, {occupancy:.1f}% of cap"
-        self._capacity_line = (
-            f"notes {total:,.0f}/327,680 {occupancy:.1f}% of the global note cap"
-        )
         if rate is not None:
-            headroom = 327680 - total
+            headroom = cap - total
             days = headroom / rate / 24 if rate > 0 else None
             note += f", {rate:+,.0f}/h"
             note += f", ~{days:.1f}d left" if days else ", not growing"
@@ -368,22 +429,23 @@ class Daemon:
                 f" | rate {rate:+,.0f} notes/h"
                 + (f" | ~{days*24:.1f}h to the cap at that rate" if days
                    else " | not growing")
-                + (f" | {shrank}/{len(counts)} sampled shards shrank"
-                   if shrank else " | no sampled shard shrank, so the 7-day reap"
-                   " is not outpacing growth")
-                + " | sampled from 16 fixed did- shards, extrapolated x256;"
-                  " paired sampling, so this is a trend not a census"
+                + (" | the total fell, so the 7-day reap is now outpacing growth"
+                   if shrinking else " | the total did not fall, so the 7-day"
+                   " reap is not outpacing growth")
+                + " | both figures served by GET /rooms; exact, not sampled"
             )
             self.journal.record(
                 "note",
                 f"capacity: {occupancy:.1f}% of the note cap, {rate:+,.0f} notes/hour"
                 + (f", ~{days:.1f} days remaining" if days else ", not growing")
-                + (f", {shrank} shards shrank (reap visible)" if shrank else
-                   ", no shard shrank (reap not outpacing growth)"),
-                "flopagent archive  # and FINDINGS 27 for the prediction",
+                + (", total fell (reap visible)" if shrinking else
+                   ", total did not fall (reap not outpacing growth)"),
+                "curl -s https://technocore.chat/rooms | grep '^# notes'",
                 occupancy_pct=round(occupancy, 2),
                 notes_per_hour=round(rate),
-                shards_shrank=shrank,
+                note_total=total,
+                note_cap=cap,
+                shrinking=shrinking,
             )
         return note
 
@@ -419,6 +481,8 @@ class Daemon:
         return status
 
     def do_broadcast(self) -> str:
+        import time as _time
+
         from .archive import corpus_from_archive
         from .broadcast import publish
         from .discover import peers as find_peers
@@ -427,8 +491,24 @@ class Daemon:
         if len(corpus.messages) < 200:
             return f"only {len(corpus.messages)} archived, waiting"
         directory = find_peers(self.client, self.rooms, top=25)
+        # The pacer already measures every room's rate to schedule itself, and
+        # the archive already knows what those polls captured. Neither number
+        # left this process before; together they are the read window, which is
+        # what a reader needs to choose an interval.
+        rates = {name: pace.rate for name, pace in self.pacer.rooms.items()}
+        captured = {row["room"]: row["captured_pct"]
+                    for row in self.archive.capture_profile()}
+        windows = window_line(rates, captured)
         parts = publish(self.client, self.client.identity, corpus, directory,
-                        self.namespace, capacity=self._capacity_line)
+                        self.namespace, capacity=self._capacity_line,
+                        windows=windows)
+        if not windows and "broadcast" in self.jobs:
+            # The first broadcast after a start runs before any room has been
+            # polled twice, so no rate exists yet and the window part is
+            # omitted rather than faked. Waiting a full period to publish it
+            # would mean a restart costs three hours of the one part that
+            # cannot be derived from anything else in the feed.
+            self.jobs["broadcast"].retry_in(300, _time.time())
         self.writes += len(parts)
         self.journal.record(
             "broadcast",

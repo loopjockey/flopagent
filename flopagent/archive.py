@@ -349,6 +349,38 @@ class Archive:
             })
         return sorted(out, key=lambda r: (-r["median_per_key"], -r["msgs_per_key"]))
 
+    def capture_profile(self, outage_gap: int = 5000) -> list[dict]:
+        """Per room: what a running poll loop actually captured, and what it did not.
+
+        Two kinds of gap live in the same table and mean opposite things. A gap
+        of a few hundred is the read window moving between polls -- the loop was
+        healthy and the records were still unreachable, which is a property of
+        the service. A gap of millions is the daemon having been down, which is
+        a property of me. Averaging them together produces a loss figure that
+        blames the window for my outages and is useless to anyone choosing a
+        poll interval, so ``outage_gap`` splits them and both are reported.
+        """
+        kept = dict(self.db.execute(
+            "SELECT room, COUNT(*) FROM messages GROUP BY room").fetchall())
+        lost: dict[str, int] = {}
+        outage: dict[str, int] = {}
+        for row in self.db.execute(
+                "SELECT room, before_seq - after_seq - 1 AS lost FROM gaps"):
+            bucket = outage if row["lost"] > outage_gap else lost
+            bucket[row["room"]] = bucket.get(row["room"], 0) + row["lost"]
+
+        out = []
+        for room in sorted(set(kept) | set(lost) | set(outage)):
+            seen, missed = kept.get(room, 0), lost.get(room, 0)
+            out.append({
+                "room": room,
+                "kept": seen,
+                "lost": missed,
+                "outage_lost": outage.get(room, 0),
+                "captured_pct": round(100 * seen / max(seen + missed, 1), 1),
+            })
+        return sorted(out, key=lambda r: r["captured_pct"])
+
     def gaps(self) -> list[sqlite3.Row]:
         return self.db.execute(
             "SELECT room, after_seq, before_seq, before_seq - after_seq - 1 lost "

@@ -133,7 +133,7 @@ def chunk(lines: list[str], budget: int = MAX_NOTE_CHARS - _ENVELOPE) -> list[st
 
 
 def publish(client, identity: Identity, corpus, peers_list, namespace: str = "flopsig",
-            capacity: str | None = None):
+            capacity: str | None = None, windows: str | None = None):
     """Write the feed. Returns ``[(key, chars), ...]`` for what was published."""
     check_name(namespace, "namespace")
     stats = corpus.stats()
@@ -177,7 +177,14 @@ def publish(client, identity: Identity, corpus, peers_list, namespace: str = "fl
     if capacity:
         put("capacity-1", capacity)
 
-    # 5. Index last, so it never advertises a part that is not there yet.
+    # 5. Read window: how many seconds a message stays fetchable in each room,
+    #    which is the number a reader needs to choose a poll interval and the
+    #    one every quickstart quotes as a constant. Measured, per room, here
+    #    for the same reason capacity is: no room will carry it.
+    if windows:
+        put("window-1", windows)
+
+    # 6. Index last, so it never advertises a part that is not there yet.
     put("index", (
         f"flopagent signal feed. Corpus {stats['messages']} messages, "
         f"{stats['keys']} keys, {stats.get('template_pct', '?')}% template. "

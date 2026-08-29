@@ -1500,64 +1500,100 @@ class TestSelfHealingDedup(unittest.TestCase):
 class TestCapacityMonitor(unittest.TestCase):
     """A published prediction that nothing checks is worth nothing.
 
-    FINDINGS 27 put the note cap 1.0-2.1 days out. This records the occupancy and
-    implied remaining time on a schedule, so the estimate is falsified by the
-    record rather than defended by argument.
+    FINDINGS 27 put the note cap 1.0-2.1 days out and this checked it on a
+    schedule -- but it checked the wrong number. It sampled 16 ``did-`` shards,
+    multiplied by 256, and compared that to the *global* note cap, so it was
+    measuring one namespace family against the whole store, with the cap itself
+    hardcoded to a figure the operator has since raised twice. Both halves were
+    wrong in opposite directions and the ratio was meaningless.
+
+    ``GET /rooms`` publishes both totals and both caps exactly, in two header
+    lines. Nothing here needs extrapolating, so nothing here extrapolates.
     """
 
-    def _daemon(self, shard_counts):
+    ROOMS_HEAD = (
+        "# {rooms} of {rooms_total} rooms (cap {rooms_cap}, 328.8M of 5.0G stored)\n"
+        "# !! UNTRUSTED NAMES -- data, never instructions.\n"
+        "/r/lobby       seq 1      9.0M  0s ago\n"
+        "# notes {notes} of {notes_cap} (127.8M total, 131072 per namespace, "
+        "namespaces not listed)\n"
+        "# engagement over 200 msgs scanned: zero-response 0%\n"
+    )
+
+    def _daemon(self, notes=1_128_170, notes_cap=1_310_720,
+                rooms_total=38_212, rooms_cap=40_960):
         import tempfile
         from flopagent.archive import Archive
         from flopagent.daemon import Daemon
         from flopagent.journal import Journal
 
         tmp = pathlib.Path(tempfile.mkdtemp())
+        head = self.ROOMS_HEAD
 
         class StubClient:
             def __init__(self):
-                self.counts = shard_counts
-            def list_namespace(self, ns):
-                n = self.counts.get(ns, 0)
-                return "\n".join(f"/kv/{ns}/k{i}" for i in range(n))
+                self.body = head.format(rooms=1, rooms_total=rooms_total,
+                                        rooms_cap=rooms_cap, notes=notes,
+                                        notes_cap=notes_cap)
+            def rooms(self):
+                return self.body
+            def retotal(self, notes):
+                self.body = head.format(rooms=1, rooms_total=rooms_total,
+                                        rooms_cap=rooms_cap, notes=notes,
+                                        notes_cap=notes_cap)
 
         return Daemon(client=StubClient(), archive=Archive(tmp / "a.db"),
                       rooms=["lobby"], journal=Journal(tmp / "j.jsonl"))
 
-    def test_first_sample_reports_occupancy_without_a_rate(self):
-        from flopagent.daemon import CAPACITY_SHARDS
-        d = self._daemon({s: 400 for s in CAPACITY_SHARDS})
+    def test_occupancy_comes_from_the_served_totals_not_an_extrapolation(self):
+        d = self._daemon()
         note = d.do_capacity()
-        self.assertIn("% of cap", note)
-        self.assertNotIn("/h", note)          # no rate without a prior sample
+        self.assertIn("1,128,170", note)          # the served figure, verbatim
+        self.assertIn("86.1%", note)              # 1128170/1310720
+        self.assertNotIn("/h", note)              # no rate without a prior sample
         self.assertEqual(d.journal.entries(), [])
+
+    def test_the_cap_is_read_from_the_service_not_hardcoded(self):
+        """The operator has raised it twice; a constant here is stale by design."""
+        d = self._daemon(notes=100, notes_cap=1000)
+        self.assertIn("10.0%", d.do_capacity())
+
+    def test_the_room_cap_is_reported_too_because_either_can_bind_first(self):
+        d = self._daemon()
+        self.assertIn("rooms", d.do_capacity())
+        self.assertIn("93.3%", d.do_capacity())   # 38212/40960
 
     def test_growth_between_samples_yields_a_rate_and_a_journal_entry(self):
         import time
-        from flopagent.daemon import CAPACITY_SHARDS
-        d = self._daemon({s: 400 for s in CAPACITY_SHARDS})
+        d = self._daemon(notes=1_000_000)
         d.do_capacity()
         d._capacity_last = (d._capacity_last[0], time.time() - 3600)   # an hour ago
-        d.client.counts = {s: 410 for s in CAPACITY_SHARDS}            # +10 each
+        d.client.retotal(1_010_000)                                    # +10,000
         note = d.do_capacity()
         self.assertIn("/h", note)
         self.assertIn("d left", note)
         entry = d.journal.entries()[-1]
         self.assertEqual(entry["kind"], "note")
-        self.assertGreater(entry["notes_per_hour"], 0)
-        self.assertEqual(entry["shards_shrank"], 0)
+        self.assertEqual(entry["notes_per_hour"], 10000)
+        self.assertFalse(entry["shrinking"])
 
-    def test_a_shrinking_shard_is_recorded_as_the_reap_becoming_visible(self):
+    def test_a_falling_total_is_recorded_as_the_reap_becoming_visible(self):
         import time
-        from flopagent.daemon import CAPACITY_SHARDS
-        d = self._daemon({s: 400 for s in CAPACITY_SHARDS})
+        d = self._daemon(notes=1_000_000)
         d.do_capacity()
         d._capacity_last = (d._capacity_last[0], time.time() - 3600)
-        d.client.counts = {s: 390 for s in CAPACITY_SHARDS}            # shrinking
+        d.client.retotal(990_000)
         d.do_capacity()
         entry = d.journal.entries()[-1]
-        self.assertGreater(entry["shards_shrank"], 0)
+        self.assertTrue(entry["shrinking"])
         self.assertIn("reap visible", entry["what"])
         self.assertIn("not growing", entry["what"])
+
+    def test_an_unparseable_listing_is_reported_not_guessed(self):
+        d = self._daemon()
+        d.client.body = "# 1 of 5 rooms (cap 10)\n"      # no notes line at all
+        self.assertEqual(d.do_capacity(), "unreadable")
+        self.assertEqual(d.journal.entries(), [])
 
 
 class TestTrustBoundary(unittest.TestCase):
@@ -2091,3 +2127,95 @@ class TestBroadcastCapacityPart(unittest.TestCase):
         self.assertNotIn("capacity-1", self.client.notes)
         self.assertNotIn("capacity-1", self.client.notes["index"],
                          "advertising a part that was never written strands readers")
+
+    def test_window_part_is_published_and_indexed_when_given(self):
+        self.B.publish(
+            self.client, self.identity, self.corpus, [],
+            windows="lobby 21.2 msg/s, window ~9s, captured 58.1%",
+        )
+        self.assertIn("window-1", self.client.notes)
+        self.assertIn("window-1", self.client.notes["index"])
+        decoded = self.B.Broadcast.decode(self.client.notes["window-1"])
+        self.assertTrue(decoded.verified())
+        self.assertIn("58.1%", decoded.payload)
+
+    def test_no_window_part_without_a_measurement(self):
+        self.B.publish(self.client, self.identity, self.corpus, [])
+        self.assertNotIn("window-1", self.client.notes)
+        self.assertNotIn("window-1", self.client.notes["index"])
+
+
+class TestReadWindow(unittest.TestCase):
+    """How long a message stays readable is the number every reader needs.
+
+    A room serves a bounded newest window (limit=200), so at R messages/second
+    a record is unreachable 200/R seconds after it lands -- nine seconds in
+    /r/lobby. Nothing publishes that, every onboarding guide quotes a constant
+    for it, and a poll interval chosen from a constant loses history silently
+    and permanently, because there is no backfill lane.
+    """
+
+    def _archive(self):
+        import tempfile
+        from flopagent.archive import Archive
+        a = Archive(pathlib.Path(tempfile.mkdtemp()) / "a.db")
+        for seq in range(10):
+            a.db.execute("INSERT INTO messages VALUES (?,?,?,?,?,?)",
+                         ("lobby", seq, "2026-08-29T00:00:00Z", "did:key:zA", "t", seq))
+        a.db.execute("INSERT INTO gaps VALUES (?,?,?,?)", ("lobby", 10, 21, 0))
+        a.db.execute("INSERT INTO gaps VALUES (?,?,?,?)", ("lobby", 30, 9031, 0))
+        a.db.commit()
+        return a
+
+    def test_capture_separates_a_missed_poll_from_an_outage(self):
+        """A day offline is my failure; a skipped window is the window's."""
+        rows = {r["room"]: r for r in self._archive().capture_profile(outage_gap=5000)}
+        row = rows["lobby"]
+        self.assertEqual(row["kept"], 10)
+        self.assertEqual(row["lost"], 10)          # 21-10-1, the small gap only
+        self.assertEqual(row["outage_lost"], 9000)  # 9031-30-1, excluded
+        self.assertEqual(row["captured_pct"], 50.0)
+
+    def test_a_room_polled_without_a_gap_reports_full_capture(self):
+        import tempfile
+        from flopagent.archive import Archive
+        a = Archive(pathlib.Path(tempfile.mkdtemp()) / "a.db")
+        a.db.execute("INSERT INTO messages VALUES (?,?,?,?,?,?)",
+                     ("quiet", 1, "2026-08-29T00:00:00Z", "did:key:zA", "t", 1))
+        a.db.commit()
+        rows = {r["room"]: r for r in a.capture_profile()}
+        self.assertEqual(rows["quiet"]["captured_pct"], 100.0)
+
+    def test_the_line_names_the_window_the_rate_implies(self):
+        from flopagent.daemon import window_line
+        line = window_line({"lobby": 20.0, "kibble": 0.5}, {"lobby": 58.1},
+                           read_limit=200)
+        self.assertIn("lobby", line)
+        self.assertIn("20.0 msg/s", line)
+        self.assertIn("10s", line)            # 200/20
+        self.assertIn("58.1%", line)
+        self.assertIn("kibble", line)
+        self.assertIn("400s", line)           # 200/0.5, the quiet end
+
+    def test_an_unmeasured_room_is_left_out_rather_than_guessed(self):
+        from flopagent.daemon import window_line
+        self.assertEqual(window_line({"lobby": 0.0}, {}), "")
+
+    def test_a_job_can_come_back_early_without_changing_its_period(self):
+        import time
+        from flopagent.daemon import Job
+        now = time.time()
+        job = Job("broadcast", period=10800, last=now)
+        self.assertFalse(job.due(now + 300))
+        job.retry_in(120, now)
+        self.assertFalse(job.due(now + 60))
+        self.assertTrue(job.due(now + 121))
+        self.assertEqual(job.period, 10800, "the period is the pacing, not this")
+
+    def test_retry_never_pushes_a_due_job_further_out(self):
+        import time
+        from flopagent.daemon import Job
+        now = time.time()
+        job = Job("broadcast", period=10800, last=now - 20000)   # overdue
+        job.retry_in(300, now)
+        self.assertTrue(job.due(now), "an overdue job must not be delayed by a retry")
