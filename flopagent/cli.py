@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 
 from .canon import CanonError, message_payload
-from .client import BASE_URL, Client, TechnocoreError
+from .client import BASE_URL, Client, TechnocoreError, TransportError
 from .identity import Identity, note_path, verify
 from .state import RETENTION_SECONDS, State
 from .health import FAIL, OK, UNKNOWN, WARN
@@ -42,8 +42,14 @@ def _load(path: Path) -> Identity:
     return Identity.load(path)
 
 
+#: Rooms the archiver follows by default. `do_faucet` discovers new rooms
+#: matching the watch terms and reports them, but reporting does not archive:
+#: faucet and technocore-genesis were both already past seq 85k and 210k when
+#: they surfaced on 2026-08-31, and nothing that passed before a room joins this
+#: list is recoverable -- there is no backfill lane (FINDINGS 8).
 DEFAULT_ROOMS = ("lobby,technocore,meta,flop-collective,chat,technocore-api,"
-                 "signing-messages,did-key-method,flop-network,kibble")
+                 "signing-messages,did-key-method,flop-network,kibble,"
+                 "faucet,technocore-genesis")
 
 
 def _client(args, need_key: bool = True) -> Client:
@@ -292,6 +298,10 @@ def _dispatch(args) -> int:
                     if r.missed:
                         print(f"  GAP /r/{r.room}: {r.missed} messages passed between "
                               "polls and are unrecoverable -- poll more often")
+                    if r.error:
+                        # Reported, never fatal: the other rooms are still being
+                        # archived and this one is what is being lost right now.
+                        print(f"  DOWN /r/{r.room}: {r.error}", file=sys.stderr)
                 passes += 1
                 total = store.stats()["messages"]
                 print(f"pass {passes}: +{stored} stored, {missed} missed, "
@@ -577,6 +587,14 @@ def _dispatch(args) -> int:
                     time.sleep(exc.retry_after or 5.0)
                     continue
                 raise
+            except TransportError as exc:
+                # A long poll that never answers is this command's normal
+                # weather. Keep the cursor and try again -- exiting here would
+                # drop the watcher for a blip, and on this service the messages
+                # missed while it was gone are unrecoverable.
+                print(f"  (unreachable: {exc.reason}; retrying)", file=sys.stderr)
+                time.sleep(2.0)
+                continue
             for message in data.get("messages", []):
                 cursor = max(cursor, message["seq"])
                 who = message.get("from", "?")

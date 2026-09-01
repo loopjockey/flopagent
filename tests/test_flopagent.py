@@ -9,9 +9,11 @@ Run:  python -m unittest discover -s tests -v
 
 from __future__ import annotations
 
+import io
 import json
 import pathlib
 import unittest
+import unittest.mock
 
 from flopagent.canon import (
     CanonError,
@@ -2261,3 +2263,356 @@ class TestReadWindow(unittest.TestCase):
         self.assertIsNone(d.jobs["faucet"].next_at,
                           "an unrepeated ask must not become the new period")
         self.assertFalse(d.jobs["faucet"].due(now + 1))
+
+
+class TestTransportResilience(unittest.TestCase):
+    """The daemon died in the field because one GET timed out.
+
+    `_get` caught only HTTPError, so a transport failure -- a read timeout, a
+    DNS blip, a reset -- left the stdlib exception to travel up through the job,
+    out of `tick`, out of `run`, and exit the process. Nine unrelated jobs died
+    for one slow socket, and the archive lost a day (FINDINGS: the read window
+    makes that permanent). A network daemon must treat the network failing as
+    the normal case it is.
+    """
+
+    def _daemon(self, boom):
+        import tempfile, time
+        from flopagent.archive import Archive
+        from flopagent.daemon import Daemon
+        from flopagent.journal import Journal
+
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        d = Daemon(client=object(), archive=Archive(tmp / "a.db"), rooms=[],
+                   journal=Journal(tmp / "j.jsonl"))
+        now = time.time()
+        for job in d.jobs.values():
+            job.last = now
+            job.next_at = None
+        ran = []
+
+        def fail():
+            raise boom
+
+        d.do_capacity = fail
+        d.do_broadcast = lambda: ran.append("broadcast") or "ok"
+        # capacity runs before broadcast in tick's fixed order.
+        d.jobs["capacity"].last = now - d.jobs["capacity"].period
+        d.jobs["broadcast"].last = now - d.jobs["broadcast"].period
+        return d, now, ran
+
+    def test_a_read_timeout_does_not_kill_the_tick(self):
+        d, now, ran = self._daemon(TimeoutError("The read operation timed out"))
+        lines = d.tick(now)                       # must not raise
+        self.assertTrue(any(line.startswith("capacity:") for line in lines))
+        self.assertEqual(d.jobs["capacity"].errors, 1)
+
+    def test_one_job_failing_does_not_stop_the_others(self):
+        d, now, ran = self._daemon(TimeoutError("boom"))
+        d.tick(now)
+        self.assertEqual(ran, ["broadcast"],
+                         "a later job must still run after an earlier one fails")
+
+    def test_a_dns_or_connection_failure_is_survived_too(self):
+        import urllib.error
+        d, now, _ = self._daemon(urllib.error.URLError("getaddrinfo failed"))
+        d.tick(now)                               # must not raise
+        self.assertEqual(d.jobs["capacity"].errors, 1)
+
+    def test_a_programming_error_still_propagates(self):
+        """Resilience must not become a blanket that hides real bugs."""
+        d, now, _ = self._daemon(AttributeError("typo"))
+        with self.assertRaises(AttributeError):
+            d.tick(now)
+
+
+class TestTransientRetry(unittest.TestCase):
+    """One blip should cost a retry, not a job cycle."""
+
+    def _client(self, failures, exc=None):
+        import urllib.error
+        from flopagent import client as client_mod
+
+        exc = exc or TimeoutError("timed out")
+        calls = {"n": 0}
+
+        def fake_urlopen(request, timeout=None):
+            calls["n"] += 1
+            if calls["n"] <= failures:
+                raise exc
+            class R:
+                def read(self):
+                    return b"ok"
+                def __enter__(self):
+                    return self
+                def __exit__(self, *a):
+                    return False
+            return R()
+
+        c = client_mod.Client(retries=3, backoff=0.0)
+        return c, fake_urlopen, calls, client_mod
+
+    def test_a_transient_failure_is_retried_and_succeeds(self):
+        c, fake, calls, mod = self._client(failures=2)
+        with unittest.mock.patch.object(mod.urllib.request, "urlopen", fake):
+            self.assertEqual(c._get("/rooms"), "ok")
+        self.assertEqual(calls["n"], 3, "should have retried twice then succeeded")
+
+    def test_a_persistent_failure_raises_a_typed_error_not_a_bare_oserror(self):
+        from flopagent.client import TransportError
+        c, fake, calls, mod = self._client(failures=99)
+        with unittest.mock.patch.object(mod.urllib.request, "urlopen", fake):
+            with self.assertRaises(TransportError):
+                c._get("/rooms")
+        self.assertEqual(calls["n"], 3, "bounded: retries must not loop forever")
+
+    def test_an_http_error_is_not_retried(self):
+        """A 404 is an answer. Retrying it wastes the budget."""
+        import urllib.error
+        from flopagent.client import TechnocoreError
+        c, _, calls, mod = self._client(failures=0)
+
+        def http_fail(request, timeout=None):
+            calls["n"] += 1
+            raise urllib.error.HTTPError("u", 404, "nope", {}, io.BytesIO(b"nope"))
+
+        with unittest.mock.patch.object(mod.urllib.request, "urlopen", http_fail):
+            with self.assertRaises(TechnocoreError):
+                c._get("/rooms")
+        self.assertEqual(calls["n"], 1, "a 404 must cost exactly one request")
+
+
+class TestSweepIsolatesRooms(unittest.TestCase):
+    """One unreachable room must not cost the whole pass.
+
+    `PollResult.error` existed from the start but nothing ever set it: a
+    transport failure on room 2 of 11 aborted the generator, so rooms 3..11 went
+    unpolled for that cycle. On this service that is not a delayed read, it is a
+    permanent hole -- the readable window is 200/(messages per second), nine
+    seconds in /r/lobby, and there is no backfill lane.
+    """
+
+    def setUp(self):
+        import tempfile
+        from flopagent.archive import Archive
+        self.dir = pathlib.Path(tempfile.mkdtemp())
+        self.store = Archive(self.dir / "a.db")
+
+    def tearDown(self):
+        self.store.close()
+
+    def _client(self, bad_room, exc):
+        class Flaky(_FakeClient):
+            def read(inner, room, since=None, wait=None, limit=None, as_json=False):
+                if room == bad_room:
+                    raise exc
+                return _FakeClient.read(inner, room, since=since, wait=wait,
+                                        limit=limit, as_json=as_json)
+        c = Flaky(count=5)
+        return c
+
+    def test_a_dead_room_does_not_abort_the_pass(self):
+        from flopagent.client import TransportError
+        exc = TransportError(TimeoutError("timed out"), "/r/dead", 3)
+        client = self._client("dead", exc)
+        results = list(self.store.sweep(client, ["a", "dead", "b"]))
+        self.assertEqual([r.room for r in results], ["a", "dead", "b"],
+                         "every room must be reported, healthy or not")
+        self.assertTrue(results[1].error, "the dead room must carry its reason")
+        self.assertFalse(results[2].error, "the room after it must still be polled")
+
+    def test_a_bug_in_the_archiver_still_propagates(self):
+        client = self._client("dead", AttributeError("typo"))
+        with self.assertRaises(AttributeError):
+            list(self.store.sweep(client, ["a", "dead", "b"]))
+
+
+class TestHealthUnreachableIsNotFailure(unittest.TestCase):
+    """"Could not check" must never be reported as "checked, and it is bad".
+
+    This module's own contract says a check that cannot be answered says UNKNOWN
+    and never guesses. Two checks broke it, and both produced advice that was
+    actively harmful to follow: a 503 on the mailbox read was reported as
+    "advertised but unreadable -> publish a new mailbox", which would churn a
+    healthy address; and any error auditing a receipt counted as "does not
+    verify -> re-issue", which made the receipt count flap 5/5, 4/5, 1/5, 5/5
+    across consecutive runs of an unchanged network.
+    """
+
+    def test_a_503_on_the_mailbox_is_unknown_not_a_warning(self):
+        from flopagent.client import TechnocoreError
+        from flopagent.health import UNKNOWN, check_mailbox
+
+        class Stub:
+            def read(self, room, limit=None, as_json=False):
+                raise TechnocoreError(503, "upstream unavailable", "/r/mb-p-x")
+
+        checks = check_mailbox(Stub(), "mailbox:mb-p-x")
+        self.assertEqual(checks[0].status, UNKNOWN)
+        self.assertNotIn("publish --mailbox", checks[0].remedy,
+                         "must not advise replacing a mailbox that may be fine")
+
+    def test_a_404_on_the_mailbox_is_still_a_warning(self):
+        from flopagent.client import TechnocoreError
+        from flopagent.health import WARN, check_mailbox
+
+        class Stub:
+            def read(self, room, limit=None, as_json=False):
+                raise TechnocoreError(404, "no such room", "/r/mb-p-x")
+
+        self.assertEqual(check_mailbox(Stub(), "mailbox:mb-p-x")[0].status, WARN)
+
+    def test_an_unreachable_server_does_not_condemn_receipts(self):
+        from flopagent.client import TransportError
+        from flopagent.health import UNKNOWN, check_receipts
+        from flopagent.state import State
+
+        state = State(path=None) if "path" in State.__dataclass_fields__ else State()
+        state.receipts = ["lobby:1", "lobby:2"]
+
+        class Stub:
+            pass
+
+        import flopagent.health as health_mod
+        def boom(client, did, room, seq):
+            raise TransportError(TimeoutError("timed out"), "/r/lobby", 3)
+
+        import flopagent.receipts as receipts_mod
+        with unittest.mock.patch.object(receipts_mod, "audit", boom):
+            checks = check_receipts(Stub(), _Ident(), state)
+        self.assertEqual(checks[0].status, UNKNOWN)
+        self.assertNotIn("re-issue", checks[0].remedy,
+                         "must not tell the operator to re-issue receipts it never checked")
+
+    def test_a_receipt_that_is_genuinely_gone_still_warns(self):
+        from flopagent.health import WARN, check_receipts
+        from flopagent.state import State
+
+        state = State(path=None) if "path" in State.__dataclass_fields__ else State()
+        state.receipts = ["lobby:1", "lobby:2"]
+
+        import flopagent.receipts as receipts_mod
+        with unittest.mock.patch.object(receipts_mod, "audit",
+                                        lambda *a, **k: (False, "reaped")):
+            checks = check_receipts(object(), _Ident(), state)
+        self.assertEqual(checks[0].status, WARN)
+
+
+class _Ident:
+    did = "did:key:zTest"
+
+
+class TestRetryDoesNotDuplicateWrites(unittest.TestCase):
+    """Retrying a write must replay it, never re-mint it.
+
+    On this service a write is a GET, so the retry added for transport failures
+    applies to writes too. It is only safe because the nonce and signature are
+    minted *before* the request and the retry replays a byte-identical URL: the
+    nonce must be strictly greater per key per room, so a replay of a write that
+    already landed is rejected by the server rather than posted twice.
+
+    If a future change mints the nonce inside the retry loop, that protection is
+    gone and a flaky link turns this agent into a duplicate poster -- the exact
+    behaviour we spend the assist gate avoiding. This test is the tripwire.
+    """
+
+    def test_every_attempt_replays_the_same_nonce_and_signature(self):
+        from flopagent import client as client_mod
+        from flopagent.identity import Identity
+
+        seen = []
+
+        def fake_urlopen(request, timeout=None):
+            seen.append(request.full_url)
+            if len(seen) < 3:
+                raise TimeoutError("timed out")
+            class R:
+                def read(self):
+                    return b"ok"
+                def __enter__(self):
+                    return self
+                def __exit__(self, *a):
+                    return False
+            return R()
+
+        c = client_mod.Client(identity=Identity.from_seed(b"\x01" * 32),
+                              retries=3, backoff=0.0)
+        with unittest.mock.patch.object(client_mod.urllib.request, "urlopen",
+                                        fake_urlopen):
+            c.say_signed("lobby", "hello")
+
+        self.assertEqual(len(seen), 3, "expected two retries then success")
+        self.assertEqual(len(set(seen)), 1,
+                         "a retry must replay the identical URL; a fresh nonce "
+                         "per attempt would post the same message twice")
+
+
+class TestServerSideStatusesAreRetried(unittest.TestCase):
+    """5xx is the service having a bad moment, not an answer about the request.
+
+    The first cut of the retry rule said "never retry HTTPError, a status code
+    IS the answer". True for 400/403/404 and wrong for 502/503/504: those carry
+    no verdict on the request at all. Found in production immediately -- a 503
+    dropped a signed post that had taken real work to compose.
+
+    Safe for writes for the same reason the transport retry is: the retry
+    replays a byte-identical URL, and the nonce must be strictly greater per key
+    per room, so a write the server actually applied before answering 503 is
+    rejected on replay rather than posted twice.
+    """
+
+    def _client_raising(self, status, then_ok=True):
+        import urllib.error
+        from flopagent import client as client_mod
+        calls = {"n": 0}
+
+        def fake(request, timeout=None):
+            calls["n"] += 1
+            if then_ok and calls["n"] > 2:
+                class R:
+                    def read(self): return b"ok"
+                    def __enter__(self): return self
+                    def __exit__(self, *a): return False
+                return R()
+            raise urllib.error.HTTPError("u", status, "busy", {}, io.BytesIO(b"busy"))
+
+        return client_mod.Client(retries=3, backoff=0.0), fake, calls, client_mod
+
+    def test_a_503_is_retried(self):
+        c, fake, calls, mod = self._client_raising(503)
+        with unittest.mock.patch.object(mod.urllib.request, "urlopen", fake):
+            self.assertEqual(c._get("/rooms"), "ok")
+        self.assertEqual(calls["n"], 3)
+
+    def test_a_502_and_504_are_retried(self):
+        for status in (502, 504):
+            c, fake, calls, mod = self._client_raising(status)
+            with unittest.mock.patch.object(mod.urllib.request, "urlopen", fake):
+                self.assertEqual(c._get("/rooms"), "ok")
+            self.assertEqual(calls["n"], 3, f"{status} should be retried")
+
+    def test_a_persistent_503_still_raises_technocore_error(self):
+        from flopagent.client import TechnocoreError
+        c, fake, calls, mod = self._client_raising(503, then_ok=False)
+        with unittest.mock.patch.object(mod.urllib.request, "urlopen", fake):
+            with self.assertRaises(TechnocoreError) as ctx:
+                c._get("/rooms")
+        self.assertEqual(ctx.exception.status, 503)
+        self.assertEqual(calls["n"], 3, "bounded")
+
+    def test_a_403_is_never_retried(self):
+        from flopagent.client import TechnocoreError
+        c, fake, calls, mod = self._client_raising(403, then_ok=False)
+        with unittest.mock.patch.object(mod.urllib.request, "urlopen", fake):
+            with self.assertRaises(TechnocoreError):
+                c._get("/rooms")
+        self.assertEqual(calls["n"], 1, "a 403 is a verdict; retrying wastes budget")
+
+    def test_a_429_is_not_retried_here(self):
+        """The caller sleeps for retry_after; burning attempts would lose that."""
+        from flopagent.client import TechnocoreError
+        c, fake, calls, mod = self._client_raising(429, then_ok=False)
+        with unittest.mock.patch.object(mod.urllib.request, "urlopen", fake):
+            with self.assertRaises(TechnocoreError):
+                c._get("/rooms")
+        self.assertEqual(calls["n"], 1)

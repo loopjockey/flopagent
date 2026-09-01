@@ -56,6 +56,33 @@ class TechnocoreError(RuntimeError):
         return float(match.group(1)) if match else None
 
 
+class TransportError(RuntimeError):
+    """The request never got an answer: timeout, DNS failure, reset socket.
+
+    Distinct from `TechnocoreError`, which means the server *did* answer and
+    said no. The difference decides whether retrying is sane, so it is a type
+    and not a flag. Raised only after the retries are spent -- a caller seeing
+    this has already waited, and should skip this cycle rather than wait more.
+    """
+
+    def __init__(self, reason: object, url: str, attempts: int) -> None:
+        super().__init__(f"{type(reason).__name__} for {url} after {attempts} attempts: {reason}")
+        self.reason = reason
+        self.url = url
+        self.attempts = attempts
+
+
+#: Server-side statuses that say "not now" rather than "no": worth replaying.
+#: 429 is absent on purpose -- it carries its own retry_after and the caller
+#: honours it.
+_RETRY_STATUS = frozenset({502, 503, 504})
+
+#: Failures worth retrying: the answer never arrived, so it may yet.
+#: `HTTPError` is deliberately absent -- it subclasses `URLError`, but a status
+#: code IS the answer and retrying it only spends budget.
+_TRANSIENT = (urllib.error.URLError, TimeoutError, ConnectionError, OSError)
+
+
 @dataclass
 class Client:
     """A client for one base URL.
@@ -68,6 +95,12 @@ class Client:
     identity: Identity | None = None
     base_url: str = BASE_URL
     timeout: float = 30.0
+    #: Attempts per request, not retries-after-the-first. The daemon runs
+    #: unattended for days, so a blip must cost a second, not a job cycle.
+    retries: int = 3
+    #: Seconds before the second attempt, doubled after each. Kept short: the
+    #: caller has its own period to fall back on and a slow room moves on.
+    backoff: float = 1.0
     #: Last budget footer seen, as ``{"reads": (left, max)}``. Advisory.
     budget: dict[str, tuple[int, int]] = field(default_factory=dict)
     #: Egress guard. Every outbound request line is checked against it before the
@@ -94,13 +127,33 @@ class Client:
         # under a path containing the operator's name is not its own false positive.
         self.redactor.guard(url[len(self.base_url.rstrip("/")):], f"GET {path}")
         request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                body = response.read().decode("utf-8", "replace")
-        except urllib.error.HTTPError as exc:
-            raise TechnocoreError(
-                exc.code, exc.read().decode("utf-8", "replace"), url
-            ) from None
+        delay = self.backoff
+        for attempt in range(1, max(1, self.retries) + 1):
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    body = response.read().decode("utf-8", "replace")
+                break
+            except urllib.error.HTTPError as exc:
+                # The server answered. Checked first: HTTPError subclasses URLError.
+                # 4xx is a verdict on this request and retrying only spends
+                # budget. 5xx is the service having a bad moment and carries no
+                # verdict at all -- a 503 dropped a composed signed post before
+                # this distinction existed. 429 is excluded deliberately: the
+                # caller sleeps for the server's own retry_after, and burning
+                # attempts here would lose that.
+                error = TechnocoreError(
+                    exc.code, exc.read().decode("utf-8", "replace"), url
+                )
+                if exc.code in _RETRY_STATUS and attempt < max(1, self.retries):
+                    time.sleep(delay)
+                    delay *= 2
+                    continue
+                raise error from None
+            except _TRANSIENT as exc:
+                if attempt >= max(1, self.retries):
+                    raise TransportError(exc, url, attempt) from None
+                time.sleep(delay)
+                delay *= 2
         self._note_budget(body)
         return body
 

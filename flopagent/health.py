@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .client import Client, TechnocoreError
+from .client import Client, TechnocoreError, TransportError
 from .identity import Identity, legacy_note_path, note_path
 from .state import RETENTION_SECONDS, State
 
@@ -142,7 +142,21 @@ def check_mailbox(client: Client, published: str) -> list[Check]:
             room = token.split(":", 1)[1]
             try:
                 data = client.read(room, limit=1, as_json=True)
+            except TransportError as exc:
+                return [Check(
+                    "mailbox", UNKNOWN, f"{room} could not be checked ({exc.reason})",
+                    "the server did not answer; this says nothing about the mailbox",
+                )]
             except TechnocoreError as exc:
+                if exc.status >= 500:
+                    # 5xx is the service having a bad moment, not a broken
+                    # address. Reported as WARN once, it advised replacing a
+                    # mailbox that answered 200 three times a minute later.
+                    return [Check(
+                        "mailbox", UNKNOWN,
+                        f"{room} could not be checked (HTTP {exc.status})",
+                        "a 5xx is the service, not your mailbox; re-run before acting",
+                    )]
                 return [Check(
                     "mailbox", WARN, f"{room} advertised but unreadable ({exc.status})",
                     "flopagent publish --mailbox <new mb-p-name>",
@@ -218,13 +232,35 @@ def check_receipts(client: Client, identity: Identity, state: State) -> list[Che
         )]
     sample = state.receipts[-5:]
     verified = 0
+    unreachable = 0
     for marker in sample:
         room, _, seq = marker.rpartition(":")
         try:
             ok, _ = audit(client, identity.did, room, int(seq))
-        except (TechnocoreError, ValueError):
+        except (TransportError, OSError):
+            # Never looked. Counting this as "does not verify" made the tally
+            # flap 5/5, 4/5, 1/5, 5/5 on an unchanged network and advised
+            # re-issuing receipts that were fine.
+            unreachable += 1
+            continue
+        except TechnocoreError as exc:
+            if exc.status >= 500:
+                unreachable += 1
+                continue
+            ok = False
+        except ValueError:
             ok = False
         verified += bool(ok)
+    checked = len(sample) - unreachable
+    if unreachable and verified == checked:
+        # Nothing seen to be wrong, but the sample is incomplete: say so rather
+        # than claim a clean bill of health the check did not earn.
+        return [Check(
+            "receipts", UNKNOWN,
+            f"{verified}/{checked} verified, {unreachable} unreachable "
+            f"({len(state.receipts)} issued)",
+            "the server did not answer for some; re-run before re-issuing anything",
+        )]
     status = OK if verified == len(sample) else WARN
     return [Check(
         "receipts", status,

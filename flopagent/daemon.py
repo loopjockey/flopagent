@@ -36,7 +36,7 @@ from pathlib import Path
 
 from .archive import Archive
 from .canon import CanonError, check_name
-from .client import Client, TechnocoreError
+from .client import Client, TechnocoreError, TransportError
 from .health import REFRESH_THRESHOLD_SECONDS
 from .identity import note_path
 from .journal import Journal
@@ -574,6 +574,16 @@ class Daemon:
             except (CanonError, ValueError) as exc:
                 job.errors += 1
                 detail = str(exc)[:80]
+            except (TransportError, OSError) as exc:
+                # The network failing is this daemon's normal weather, not an
+                # exit condition. One timed-out GET in `do_capacity` once took
+                # the whole loop down and cost a day of archive that the read
+                # window makes unrecoverable -- nine jobs died for one socket.
+                # Caught per job, so the other eight still run. Deliberately
+                # NOT `Exception`: a TypeError here is a bug and must still
+                # crash loudly rather than loop forever failing quietly.
+                job.errors += 1
+                detail = f"unreachable ({type(exc).__name__})"
             job.last = now
             lines.append(f"{name}: {detail}")
         return lines

@@ -34,7 +34,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from .client import Client, TechnocoreError
+from .client import Client, TechnocoreError, TransportError
 
 DEFAULT_DB = Path("identity/archive.db")
 
@@ -198,9 +198,20 @@ class Archive:
         return total
 
     def sweep(self, client: Client, rooms: list[str], wait: int | None = None):
-        """One pass over every room, draining each. Yields a :class:`PollResult`."""
+        """One pass over every room, draining each. Yields a :class:`PollResult`.
+
+        A room that cannot be reached is reported, not raised: it yields a result
+        carrying ``error`` and the pass continues. One flaky room used to abort
+        the generator and leave every room after it unpolled for that cycle,
+        which on this service is a permanent hole rather than a late read -- the
+        readable window is 200/(messages per second) and there is no backfill.
+        Bugs still raise; only the network failing is treated as routine.
+        """
         for room in rooms:
-            yield self.drain(client, room, wait=wait)
+            try:
+                yield self.drain(client, room, wait=wait)
+            except (TransportError, TechnocoreError, OSError) as exc:
+                yield PollResult(room=room, error=f"{type(exc).__name__}: {exc}"[:200])
 
     # ---- query -----------------------------------------------------------
 
